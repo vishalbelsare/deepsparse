@@ -134,7 +134,6 @@ class PipelineEngineConfig(BaseSettings):
     config: Optional[str] = None
 
     @staticmethod
-    @lru_cache()
     def get_config() -> PipelineConfigType:
         """
         :return: PipelineEngineSettings for setting up the pipeline object
