@@ -18,9 +18,10 @@ from typing import Dict, List
 
 import ndjson
 import pytest
-from helpers import predownload_stub, run_command
+from tests.helpers import predownload_stub, run_command
 
 
+@pytest.mark.smoke
 def test_run_inference_help():
     cmd = ["deepsparse.transformers.run_inference", "--help"]
     print(f"\n==== test_run_inference_help command ====\n{' '.join(cmd)}")
@@ -33,14 +34,14 @@ def test_run_inference_help():
     assert "fail" not in res.stdout.lower()
 
 
+@pytest.mark.smoke
 def test_run_inference_ner(cleanup: Dict[str, List]):
     cmd = [
         "deepsparse.transformers.run_inference",
         "--task",
         "ner",
         "--model-path",
-        "zoo:nlp/token_classification/bert-base/pytorch/huggingface/conll2003/"
-        "12layer_pruned80_quant-none-vnni",
+        "zoo:bert-large-conll2003_wikipedia_bookcorpus-pruned80.4block_quantized",
         "--data",
         "tests/test_data/bert-ner-test-input.json",
         "--output-file",
@@ -58,7 +59,7 @@ def test_run_inference_ner(cleanup: Dict[str, List]):
     assert "fail" not in res.stdout.lower()
 
     # light validation of output file
-    expected = "red"
+    expected = "canadian"
     assert os.path.exists("output.json")
     with open("output.json") as f:
         data = json.load(f)
@@ -69,16 +70,15 @@ def test_run_inference_ner(cleanup: Dict[str, List]):
 @pytest.mark.parametrize(
     ("input_format", "model_path", "local_model"),
     [
-        (
+        pytest.param(
             "csv",
-            "zoo:nlp/question_answering/bert-base/pytorch/huggingface/squad/"
-            "pruned_6layers-aggressive_98",
+            "zoo:bert-base-squad_wikipedia_bookcorpus-pruned90",
             True,
+            marks=pytest.mark.smoke,
         ),
         (
             "json",
-            "zoo:nlp/question_answering/bert-base/pytorch/huggingface/squad/"
-            "pruned_6layers-aggressive_98",
+            "zoo:bert-base-squad_wikipedia_bookcorpus-pruned90",
             False,
         ),
     ],
@@ -88,7 +88,7 @@ def test_run_inference_qa(
 ):
     if local_model:
         model = predownload_stub(model_path, copy_framework_files=True)
-        model_path = model.dir_path
+        model_path = model.path
 
     cmd = [
         "deepsparse.transformers.run_inference",
@@ -128,31 +128,32 @@ def test_run_inference_qa(
     [
         (
             "csv",
-            "zoo:nlp/text_classification/bert-base/pytorch/huggingface/sst2/base-none",
+            "zoo:bert-large-mnli_wikipedia_bookcorpus-pruned80.4block_quantized",
             False,
             ["--batch-size", "1", "--engine-type", "onnxruntime"],
         ),
         (
             "txt",
-            "zoo:nlp/text_classification/bert-base/pytorch/huggingface/sst2/base-none",
+            "zoo:bert-large-mnli_wikipedia_bookcorpus-pruned80.4block_quantized",
             True,
             ["--num-cores", "4", "--engine-type", "onnxruntime"],
         ),
-        (
+        pytest.param(
             "csv",
-            "zoo:nlp/text_classification/bert-base/pytorch/huggingface/sst2/base-none",
+            "zoo:bert-large-mnli_wikipedia_bookcorpus-pruned80.4block_quantized",
             True,
             [],
+            marks=pytest.mark.smoke,
         ),
         (
             "json",
-            "zoo:nlp/text_classification/bert-base/pytorch/huggingface/sst2/base-none",
+            "zoo:bert-large-mnli_wikipedia_bookcorpus-pruned80.4block_quantized",
             True,
             ["--batch-size", "5", "--engine-type", "deepsparse"],
         ),
         (
             "txt",
-            "zoo:nlp/text_classification/bert-base/pytorch/huggingface/sst2/base-none",
+            "zoo:bert-large-mnli_wikipedia_bookcorpus-pruned80.4block_quantized",
             True,
             ["--batch-size", "10", "--num-cores", "4"],
         ),
@@ -167,7 +168,7 @@ def test_run_inference_sst(
 ):
     if local_model:
         model = predownload_stub(model_path, copy_framework_files=True)
-        model_path = model.dir_path
+        model_path = model.path
 
     cmd = [
         "deepsparse.transformers.run_inference",

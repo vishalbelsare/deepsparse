@@ -1,0 +1,1 @@
+deepsparse[transformers]>=1.5.2

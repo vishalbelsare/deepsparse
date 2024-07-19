@@ -35,13 +35,14 @@ tasks
 """
 
 
+import warnings
 from typing import List, Type, Union
 
 import numpy
 from pydantic import BaseModel, Field
 from transformers.tokenization_utils_base import PaddingStrategy, TruncationStrategy
 
-from deepsparse import Pipeline
+from deepsparse.legacy import Pipeline
 from deepsparse.transformers.pipelines import TransformersPipeline
 
 
@@ -68,8 +69,10 @@ class TextClassificationOutput(BaseModel):
     Schema for text_classification pipeline output. Values are in batch order
     """
 
-    labels: List[str] = Field(description="The predicted labels in batch order")
-    scores: List[float] = Field(
+    labels: List[Union[str, List[str]]] = Field(
+        description="The predicted labels in batch order"
+    )
+    scores: List[Union[float, List[float]]] = Field(
         description="The corresponding probability for each label in the batch"
     )
 
@@ -78,13 +81,15 @@ class TextClassificationOutput(BaseModel):
     task="text_classification",
     task_aliases=["glue", "sentiment_analysis"],
     default_model_path=(
-        "zoo:nlp/sentiment_analysis/bert-base/pytorch/huggingface/"
-        "sst2/12layer_pruned80_quant-none-vnni"
+        "zoo:bert-large-mnli_wikipedia_bookcorpus-pruned80.4block_quantized"
     ),
 )
 class TextClassificationPipeline(TransformersPipeline):
     """
-    transformers text classification pipeline
+    transformers text classification pipeline.
+    Scores are returned as sigmoid over logits if one label is given or
+    the model config is set to "multi_label_classification". Softmax
+    returned otherwise
 
     example instantiation:
     ```python
@@ -113,10 +118,8 @@ class TextClassificationPipeline(TransformersPipeline):
     sentiments = text_classifier([["the food tastes great"], ["the food tastes bad"]])
     ```
 
-    :param model_path: sparsezoo stub to a transformers model, an ONNX file, or
-        (preferred) a directory containing a model.onnx, tokenizer config, and model
-        config. If no tokenizer and/or model config(s) are found, then they will be
-        loaded from huggingface transformers using the `default_model_name` key
+    :param model_path: sparsezoo stub to a transformers model or (preferred) a
+        directory containing a model.onnx, tokenizer config, and model config
     :param engine_type: inference engine to use. Currently supported values include
         'deepsparse' and 'onnxruntime'. Default is 'deepsparse'
     :param batch_size: static batch size to use for inference. Default is 1
@@ -129,11 +132,43 @@ class TextClassificationPipeline(TransformersPipeline):
     :param alias: optional name to give this pipeline instance, useful when
         inferencing with multiple models. Default is None
     :param sequence_length: sequence length to compile model and tokenizer for.
-        Default is 128
-    :param default_model_name: huggingface transformers model name to use to
-        load a tokenizer and model config when none are provided in the `model_path`.
-        Default is 'bert-base-uncased'
+        If a list of lengths is provided, then for each length, a model and
+        tokenizer will be compiled capable of handling that sequence length
+        (also known as a bucket). Default is 128
+    :param top_k: number of labels with the highest score to return. Default is 1
+    :param return_all_scores: [DEPRECATED] set top_k to desired value instead.
+        If True, instead of returning the prediction as the
+        argmax of model class predictions, will return all scores and labels as
+        a list for each result in the batch. Default is False
     """
+
+    def __init__(
+        self,
+        *,
+        top_k: int = 1,
+        return_all_scores: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self._top_k = _get_top_k(top_k, return_all_scores, self.config.num_labels)
+        self._return_all_scores = return_all_scores
+
+    @property
+    def top_k(self) -> int:
+        """
+        :return: number of labels with the highest score to return
+        """
+        return self._top_k
+
+    @property
+    def return_all_scores(self) -> str:
+        """
+        :return: if True, instead of returning the prediction as the
+            argmax of model class predictions, will return all scores and labels as
+            a list for each result in the batch
+        """
+        return self._return_all_scores
 
     @property
     def input_schema(self) -> Type[BaseModel]:
@@ -182,8 +217,16 @@ class TextClassificationPipeline(TransformersPipeline):
         :return: inputs of this model processed into a list of numpy arrays that
             can be directly passed into the forward pass of the pipeline engine
         """
+        sequences = inputs.sequences
+        if isinstance(sequences, List) and all(
+            isinstance(sequence, List) and len(sequence) == 1 for sequence in sequences
+        ):
+            # if batch items contain only one sequence but are wrapped in lists, unwrap
+            # for use as tokenizer input
+            sequences = [sequence[0] for sequence in sequences]
+
         tokens = self.tokenizer(
-            inputs.sequences,
+            sequences,
             add_special_tokens=True,
             return_tensors="np",
             padding=PaddingStrategy.MAX_LENGTH.value,
@@ -202,20 +245,73 @@ class TextClassificationPipeline(TransformersPipeline):
         if isinstance(outputs, list):
             outputs = outputs[0]
 
+        use_sigmoid = self.config.num_labels == 1 or (
+            self.config.problem_type == "multi_label_classification"
+        )
         scores = (
             1.0 / (1.0 + numpy.exp(-outputs))
-            if self.config.num_labels == 1
+            if use_sigmoid
             else numpy.exp(outputs) / numpy.exp(outputs).sum(-1, keepdims=True)
         )
 
         labels = []
         label_scores = []
-
         for score in scores:
-            labels.append(self.config.id2label[score.argmax()])
-            label_scores.append(score.max().item())
+            if self._top_k == 1:
+                labels.append(self.config.id2label[score.argmax()])
+                label_scores.append(score.max().item())
+            else:
+                ranked_idxs = (-score.reshape(-1)).argsort()[: self.top_k]
+                score = score.reshape(-1).tolist()
+                labels.append([self.config.id2label[idx] for idx in ranked_idxs])
+                label_scores.append([score[idx] for idx in ranked_idxs])
 
         return self.output_schema(
             labels=labels,
             scores=label_scores,
         )
+
+    @staticmethod
+    def route_input_to_bucket(
+        *args, input_schema: BaseModel, pipelines: List[TransformersPipeline], **kwargs
+    ) -> Pipeline:
+        """
+        :param input_schema: The schema representing an input to the pipeline
+        :param pipelines: Different buckets to be used
+        :return: The correct Pipeline object (or Bucket) to route input to
+        """
+        tokenizer = pipelines[-1].tokenizer
+        tokens = tokenizer(
+            input_schema.sequences,
+            add_special_tokens=True,
+            return_tensors="np",
+            padding=False,
+            truncation=False,
+        )
+        input_seq_len = max(map(len, tokens["input_ids"]))
+        return TransformersPipeline.select_bucket_by_seq_len(input_seq_len, pipelines)
+
+
+def _get_top_k(top_k: int, return_all_scores: bool, num_labels: int) -> int:
+    # handle deprecations of return_all_scores
+    if top_k <= 0:
+        raise ValueError(f"text_classification top_k must be > 0. found {top_k}")
+    if return_all_scores and top_k not in [1, num_labels]:
+        # top_k is not set to default, but does not match num_labels
+        # for return_all_scores
+        raise ValueError(
+            f"Mismatch: return_all_scores set to {return_all_scores} with "
+            f"{num_labels} in model config, but top_k set to {top_k}. "
+            "return_all_scores is deprecated, set top_k instead"
+        )
+
+    if top_k == 1 and return_all_scores:
+        # set top_k to num_labels from config and warn
+        warnings.warn(
+            f"return_all_scores deprecated, set {top_k} instead. setting "
+            f"top_k to num_lables from config: {num_labels}",
+            category=DeprecationWarning,
+        )
+        top_k = num_labels
+
+    return top_k

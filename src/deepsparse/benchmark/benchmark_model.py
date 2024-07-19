@@ -17,38 +17,41 @@ Benchmarking script for ONNX models with the DeepSparse engine.
 
 ##########
 Command help:
-usage: deepsparse.benchmark [-h] [-b BATCH_SIZE] [-shapes INPUT_SHAPES]
+usage: deepsparse.benchmark [-h] [-b BATCH_SIZE] [-i INPUT_SHAPES]
                             [-ncores NUM_CORES] [-s {async,sync,elastic}]
                             [-t TIME] [-w WARMUP_TIME] [-nstreams NUM_STREAMS]
-                            [-pin {none,core,numa}]
-                            [-e {deepsparse,onnxruntime}] [-q]
-                            [-x EXPORT_PATH]
+                            [-seq_len SEQUENCE_LENGTH]
+                            [-input_ids_len INPUT_IDS_LENGTH]
+                            [-pin {none,core,numa}] [-e ENGINE]
+                            [--no-internal-kv-cache] [-q] [-x EXPORT_PATH]
+                            [--disable-kv-cache-overrides]
+                            [--num-kv-cache-tokens NUM_KV_CACHE_TOKENS]
                             model_path
 
 Benchmark ONNX models in the DeepSparse Engine
 
 positional arguments:
-  model_path            Path to an ONNX model file or SparseZoo model stub.
+  model_path            Path to an ONNX model file or SparseZoo model stub
 
 optional arguments:
-  -h, --help            show this help message and exit.
+  -h, --help            show this help message and exit
   -b BATCH_SIZE, --batch_size BATCH_SIZE
                         The batch size to run the analysis for. Must be
-                        greater than 0.
-  -shapes INPUT_SHAPES, --input_shapes INPUT_SHAPES
+                        greater than 0
+  -i INPUT_SHAPES, -shapes INPUT_SHAPES, --input_shapes INPUT_SHAPES
                         Override the shapes of the inputs, i.e. -shapes
                         "[1,2,3],[4,5,6],[7,8,9]" results in input0=[1,2,3]
-                        input1=[4,5,6] input2=[7,8,9].
+                        input1=[4,5,6] input2=[7,8,9]
   -ncores NUM_CORES, --num_cores NUM_CORES
                         The number of physical cores to run the analysis on,
-                        defaults to all physical cores available on the system.
+                        defaults to all physical cores available on the system
   -s {async,sync,elastic}, --scenario {async,sync,elastic}
                         Choose between using the async, sync and elastic
                         scenarios. Sync and async are similar to the single-
                         stream/multi-stream scenarios. Elastic is a newer
                         scenario that behaves similarly to the async scenario
                         but uses a different scheduling backend. Default value
-                        is async.
+                        is sync.
   -t TIME, --time TIME  The number of seconds the benchmark will run. Default
                         is 10 seconds.
   -w WARMUP_TIME, --warmup_time WARMUP_TIME
@@ -59,16 +62,41 @@ optional arguments:
                         parallel using async scenario. Default is
                         automatically determined for given hardware and may be
                         sub-optimal.
+  -seq_len SEQUENCE_LENGTH, --sequence_length SEQUENCE_LENGTH
+                        The sequence length to run the KV cache supported
+                        model benchmarks for. Must be seq_len >= 1, default is
+                        None
+  -input_ids_len INPUT_IDS_LENGTH, --input_ids_length INPUT_IDS_LENGTH
+                        The input ids length to run the KV cache supported
+                        model benchmarks for. Must be 1 <= input_ids_len <=
+                        seq_len, default is 1
   -pin {none,core,numa}, --thread_pinning {none,core,numa}
                         Enable binding threads to cores ('core' the default),
                         threads to cores on sockets ('numa'), or disable
-                        ('none').
-  -e {deepsparse,onnxruntime}, --engine {deepsparse,onnxruntime}
+                        ('none')
+  -e ENGINE, --engine ENGINE
                         Inference engine backend to run eval on. Choices are
                         'deepsparse', 'onnxruntime'. Default is 'deepsparse'.
-  -q, --quiet           Lower logging verbosity.
+                        Can also specify a user defined engine class by giving
+                        the script and class name in the following format
+                        <path to python script>:<Engine Class name>. This
+                        engine class will be dynamically imported during
+                        runtime
+  --no-internal-kv-cache, --no_internal_kv_cache
+                        DeepSparse engine only - If not present, and model has
+                        KV cache, KV Cache state will be managed within the
+                        compiled deepsparse model. This is preferred when
+                        applicable for best performance. Set flag to disable
+  -q, --quiet           Lower logging verbosity
   -x EXPORT_PATH, --export_path EXPORT_PATH
-                        Store results into a JSON file.
+                        Store results into a JSON file
+  --disable-kv-cache-overrides, --disable_kv_cache_overrides
+                        If set, it will not alter the model
+                        with kv cache overrides
+  --num-kv-cache-tokens NUM_KV_CACHE_TOKENS, --num_kv_cache_tokens NUM_KV_CACHE_TOKENS
+                        If using internal kv cache, sets the number of tokens to fill 
+                        the cache with. Must be between 0 and sequence_length -
+                        input_ids_length
 
 ##########
 Example on a BERT from SparseZoo:
@@ -82,6 +110,13 @@ deepsparse.benchmark \
    --input_shapes "[1,512],[1,512],[1,512]"
 
 ##########
+Example on a CodeGen (model with KV cache support)
+from SparseZoo with input_ids_length 10 and sequence length 256:
+deepsparse.benchmark \
+   zoo:nlg/text_generation/codegen_mono-350m/pytorch/huggingface/bigpython_bigquery_thepile/pruned50-none \
+   --input_ids_length 10 --sequence_length 256
+
+##########
 Example on local ONNX model:
 deepsparse.benchmark /PATH/TO/model.onnx
 
@@ -89,23 +124,38 @@ deepsparse.benchmark /PATH/TO/model.onnx
 Example on local ONNX model at batch size 32 with synchronous (singlestream) execution:
 deepsparse.benchmark /PATH/TO/model.onnx --batch_size 32 --scenario sync
 
-"""
+"""  # noqa E501
 
 import argparse
+import importlib
 import json
 import logging
 import os
+from typing import Dict, Optional
 
-from deepsparse import Scheduler, compile_model
+from deepsparse import Engine, __version__
+from deepsparse.benchmark.helpers import (
+    decide_thread_pinning,
+    parse_num_streams,
+    parse_scenario,
+    parse_scheduler,
+)
 from deepsparse.benchmark.ort_engine import ORTEngine
 from deepsparse.benchmark.stream_benchmark import model_stream_benchmark
+from deepsparse.cpu import cpu_architecture
 from deepsparse.log import set_logging_level
 from deepsparse.utils import (
     generate_random_inputs,
+    has_model_kv_cache,
+    infer_sequence_length,
     model_to_path,
     override_onnx_input_shapes,
+    overwrite_onnx_model_inputs_for_kv_cache_models,
     parse_input_shapes,
 )
+
+
+__all__ = ["benchmark_model"]
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -146,7 +196,7 @@ def parse_args():
         "-ncores",
         "--num_cores",
         type=int,
-        default=None,
+        default=cpu_architecture().num_available_physical_cores,
         help=(
             "The number of physical cores to run the analysis on, "
             "defaults to all physical cores available on the system"
@@ -156,13 +206,13 @@ def parse_args():
         "-s",
         "--scenario",
         type=str,
-        default="async",
+        default="sync",
         choices=["async", "sync", "elastic"],
         help=(
             "Choose between using the async, sync and elastic scenarios. Sync and "
             "async are similar to the single-stream/multi-stream scenarios. Elastic "
             "is a newer scenario that behaves similarly to the async scenario "
-            "but uses a different scheduling backend. Default value is async."
+            "but uses a different scheduling backend. Default value is sync."
         ),
     )
     parser.add_argument(
@@ -194,6 +244,22 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "-seq_len",
+        "--sequence_length",
+        type=int,
+        default=None,
+        help="The sequence length to run the KV cache supported model "
+        "benchmarks for. Must be seq_len >= 1, default is None",
+    )
+    parser.add_argument(
+        "-input_ids_len",
+        "--input_ids_length",
+        type=int,
+        default=1,
+        help="The input ids length to run the KV cache supported model "
+        "benchmarks for. Must be 1 <= input_ids_len <= seq_len, default is 1",
+    )
+    parser.add_argument(
         "-pin",
         "--thread_pinning",
         type=str,
@@ -209,11 +275,25 @@ def parse_args():
         "--engine",
         type=str,
         default=DEEPSPARSE_ENGINE,
-        choices=[DEEPSPARSE_ENGINE, ORT_ENGINE],
         help=(
             "Inference engine backend to run eval on. Choices are 'deepsparse', "
-            "'onnxruntime'. Default is 'deepsparse'"
+            "'onnxruntime'. Default is 'deepsparse'. Can also specify a user "
+            "defined engine class by giving the script and class name in the "
+            "following format <path to python script>:<Engine Class name>. This "
+            "engine class will be dynamically imported during runtime"
         ),
+    )
+    parser.add_argument(
+        "--no-internal-kv-cache",
+        "--no_internal_kv_cache",
+        help=(
+            "DeepSparse engine only - If not present, and model has KV cache, "
+            "KV Cache state will be managed within the compiled deepsparse "
+            "model. This is preferred when applicable for best performance. Set "
+            "flag to disable"
+        ),
+        action="store_true",
+        default=False,
     )
     parser.add_argument(
         "-q",
@@ -229,154 +309,285 @@ def parse_args():
         type=str,
         default=None,
     )
+    parser.add_argument(
+        "--disable-kv-cache-overrides",
+        "--disable_kv_cache_overrides",
+        help=("If set, it will not alter the model with kv cache overrides"),
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--num-kv-cache-tokens",
+        "--num_kv_cache_tokens",
+        type=int,
+        default=os.environ.get("NM_BENCHMARK_KV_TOKENS") or 1,
+        help=(
+            "If using internal kv cache, sets the number of tokens to fill the cache "
+            "with. Must be between 0 and sequence_length - input_ids_length"
+        ),
+    )
 
     return parser.parse_args()
 
 
-def decide_thread_pinning(pinning_mode: str):
-    pinning_mode = pinning_mode.lower()
+def load_custom_engine(custom_engine_identifier: str):
+    """
+    import a custom engine based off the specified `custom_engine_identifier`
+    from user specified script
 
-    if pinning_mode in "core":
-        os.environ["NM_BIND_THREADS_TO_CORES"] = "1"
-        _LOGGER.info("Thread pinning to cores enabled")
-    elif pinning_mode in "numa":
-        os.environ["NM_BIND_THREADS_TO_CORES"] = "0"
-        os.environ["NM_BIND_THREADS_TO_SOCKETS"] = "1"
-        _LOGGER.info("Thread pinning to socket/numa nodes enabled")
-    elif pinning_mode in "none":
-        os.environ["NM_BIND_THREADS_TO_CORES"] = "0"
-        os.environ["NM_BIND_THREADS_TO_SOCKETS"] = "0"
-        _LOGGER.info("Thread pinning disabled, performance may be sub-optimal")
-    else:
-        _LOGGER.info(
-            "Recieved invalid option for thread_pinning '{}', skipping".format(
-                pinning_mode
-            )
-        )
+    :param custom_engine_identifier: string in the form of
+           '<path_to_the_python_script>:<custom_engine_class_name>
+    :return: custom engine class object
+    """
+    path, engine_object_name = custom_engine_identifier.split(":")
+    spec = importlib.util.spec_from_file_location("user_defined_custom_engine", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return getattr(module, engine_object_name)
 
 
-def parse_scheduler(scenario):
-    if scenario == "multistream":
-        return Scheduler.multi_stream
-    elif scenario == "singlestream":
-        return Scheduler.single_stream
-    elif scenario == "elastic":
-        return Scheduler.elastic
-    else:
-        return Scheduler.multi_stream
+def benchmark_model(
+    model_path: str,
+    batch_size: int = 1,
+    input_shapes: str = "",
+    num_cores: Optional[int] = None,
+    scenario: str = "sync",
+    time: int = 10,
+    warmup_time: int = 2,
+    num_streams: Optional[int] = None,
+    sequence_length: Optional[int] = None,
+    input_ids_length: Optional[int] = 1,
+    thread_pinning: str = "core",
+    engine: str = DEEPSPARSE_ENGINE,
+    internal_kv_cache: bool = True,
+    quiet: bool = False,
+    export_path: Optional[str] = None,
+    disable_kv_cache_overrides: bool = False,
+    num_kv_cache_tokens: int = 1,
+) -> Dict:
+    """
+    Benchmark a model on a given engine
 
+    :param model_path: Path or stub to the model
+    :param batch_size: Batch size, Defaults to 1.
+    :param input_shapes: Shape of the input. Defaults to "".
+    :param num_cores: Number of cores to use. Defaults to None.
+    :param scenario: The "type" of scenario to use. Defaults to "sync".
+    :param time: Total run-time to run the benchmark for. Defaults to 10.
+    :param warmup_time: Time to run the engine before running benchmarks. Defaults to 2.
+    :param num_streams: Number of streams. Defaults to None.
+    :param sequence_length: Sequence length for text-gen. Defaults to None.
+    :param input_ids_length: Length of the input ids. Defaults to 1.
+    :param thread_pinning: The hardware to pin for threading. Defaults to "core".
+    :param engine: The type of engine to use. Defaults to our proprietary
+        DEEPSPARSE_ENGINE.
+    :param internal_kv_cache: Runs the benchmark with or w/o the kv cache.
+        Defaults to True.
+    :param quiet: Verbose option if set to False. Defaults to False.
+    :param export_path: Path to save the results. Defaults to None.
+    :param disable_kv_cache_overrides: Option to override the kv cache.
+        Defaults to False.
+    :returns: Dictionary of benchmarked metrics
 
-def parse_scenario(scenario):
-    if scenario == "async":
-        return "multistream"
-    elif scenario == "sync":
-        return "singlestream"
-    elif scenario == "elastic":
-        return "elastic"
-    else:
-        _LOGGER.info(
-            "Recieved invalid option for scenario'{}', defaulting to async".format(
-                scenario
-            )
-        )
-        return "multistream"
+    """
 
-
-def main():
-
-    args = parse_args()
-
-    if args.quiet:
+    if quiet:
         set_logging_level(logging.WARN)
 
-    decide_thread_pinning(args.thread_pinning)
+    if num_cores is None:
+        num_cores = cpu_architecture().num_available_physical_cores
 
-    scenario = parse_scenario(args.scenario.lower())
+    decide_thread_pinning(thread_pinning)
+
+    scenario = parse_scenario(scenario.lower())
     scheduler = parse_scheduler(scenario)
-    input_shapes = parse_input_shapes(args.input_shapes)
+    input_shapes = parse_input_shapes(input_shapes)
 
-    orig_model_path = args.model_path
-    args.model_path = model_to_path(args.model_path)
+    orig_model_path = model_path
+    model_path = model_to_path(model_path)
+
+    cached_outputs = None
+    if has_model_kv_cache(model_path):
+        if not disable_kv_cache_overrides:
+            if not sequence_length:
+                sequence_length = infer_sequence_length(model_path)
+                if not sequence_length:
+                    raise ValueError(
+                        "Unable to infer sequence length from model. "
+                        "Specify it manually through `sequence_length` argument."
+                    )
+            if input_ids_length > sequence_length:
+                raise ValueError(
+                    f"input_ids_length: {input_ids_length} "
+                    f"must be less than sequence_length: {sequence_length}"
+                )
+
+            _LOGGER.info(
+                "Found model with KV cache support. "
+                "Benchmarking the autoregressive model with "
+                f"input_ids_length: {input_ids_length} and "
+                f"sequence length: {sequence_length}."
+            )
+
+            (
+                model_path,
+                cached_outputs,
+                _,
+            ) = overwrite_onnx_model_inputs_for_kv_cache_models(
+                onnx_file_path=model_path,
+                input_ids_length=input_ids_length,
+                sequence_length=sequence_length,
+                batch_size=batch_size,
+            )
+
+        if internal_kv_cache and engine != DEEPSPARSE_ENGINE:
+            raise ValueError(
+                "Attempting to benchmark a model using engine: "
+                f"{engine} and internal_kv_cache set to True. "
+                "The use of internal_kv_cache is only "
+                f"supported for the engine: {DEEPSPARSE_ENGINE}. "
+                f"To disable the use of the internal_kv_cache, "
+                f"set the flag: --no-internal-kv-cache"
+            )
+
+        # This environment variable sets the KV cache to a fixed number of prefilled
+        # tokens for consistent benchmarking
+        os.environ["NM_BENCHMARK_KV_TOKENS"] = str(num_kv_cache_tokens)
+
+        _LOGGER.info(
+            f"Benchmarking Engine: {engine} with "
+            f"{'internal' if internal_kv_cache else 'external'} KV cache management "
+            f"and {num_kv_cache_tokens} tokens in the cache"
+        )
+    else:
+        input_ids_length = None
+        sequence_length = None
+        internal_kv_cache = False
+
+    num_streams = parse_num_streams(num_streams, num_cores, scenario)
 
     # Compile the ONNX into a runnable model
-    if args.engine == DEEPSPARSE_ENGINE:
-        model = compile_model(
-            model=args.model_path,
-            batch_size=args.batch_size,
-            num_cores=args.num_cores,
+    if engine == DEEPSPARSE_ENGINE:
+        model = Engine(
+            model=model_path,
+            batch_size=batch_size,
+            num_cores=num_cores,
+            num_streams=num_streams,
             scheduler=scheduler,
             input_shapes=input_shapes,
+            cached_outputs=cached_outputs if internal_kv_cache else None,
         )
-    elif args.engine == ORT_ENGINE:
+    elif engine == ORT_ENGINE:
         model = ORTEngine(
-            model=args.model_path,
-            batch_size=args.batch_size,
-            num_cores=args.num_cores,
+            model=model_path,
+            batch_size=batch_size,
+            num_cores=num_cores,
             input_shapes=input_shapes,
         )
+    elif ":" in engine:
+        engine = load_custom_engine(custom_engine_identifier=engine)
+        model = engine(
+            model_path=model_path,
+            batch_size=batch_size,
+            num_cores=num_cores,
+        )
+    else:
+        raise ValueError(f"Invalid engine choice '{engine}'")
     _LOGGER.info(model)
 
     # Generate random inputs to feed the model
     # TODO(mgoin): should be able to query Engine class instead of loading ONNX
     if input_shapes:
-        with override_onnx_input_shapes(args.model_path, input_shapes) as model_path:
-            input_list = generate_random_inputs(model_path, args.batch_size)
+        with override_onnx_input_shapes(model_path, input_shapes) as model_path:
+            input_list = generate_random_inputs(model_path, batch_size)
+    elif hasattr(model, "generate_random_inputs"):
+        input_list = model.generate_random_inputs()
+    elif hasattr(engine, "generate_random_inputs"):
+        input_list = engine.generate_random_inputs(batch_size=batch_size)
     else:
-        input_list = generate_random_inputs(args.model_path, args.batch_size)
-
-    if args.num_streams:
-        _LOGGER.info("num_streams set to {}".format(args.num_streams))
-    elif not args.num_streams and scenario not in "singlestream":
-        # If num_streams isn't defined, find a default
-        args.num_streams = max(1, int(model.num_cores / 2))
-        _LOGGER.info(
-            "num_streams default value chosen of {}. "
-            "This requires tuning and may be sub-optimal".format(args.num_streams)
-        )
+        input_list = generate_random_inputs(model_path, batch_size)
 
     # Benchmark
     _LOGGER.info(
-        "Starting '{}' performance measurements for {} seconds".format(
-            args.scenario, args.time
-        )
+        "Starting '{}' performance measurements for {} seconds".format(scenario, time)
     )
     benchmark_result = model_stream_benchmark(
         model,
         input_list,
         scenario=scenario,
-        seconds_to_run=args.time,
-        seconds_to_warmup=args.warmup_time,
+        seconds_to_run=time,
+        seconds_to_warmup=warmup_time,
+        num_streams=num_streams,
+        internal_kv_cache=internal_kv_cache,
+    )
+    export_dict = {
+        "engine": str(model),
+        "version": __version__,
+        "orig_model_path": orig_model_path,
+        "model_path": model_path,
+        "batch_size": batch_size,
+        "input_shapes": input_shapes,
+        "num_cores": num_cores,
+        "scenario": scenario,
+        "scheduler": str(model.scheduler),
+        "seconds_to_run": time,
+        "num_streams": num_streams,
+        "benchmark_result": benchmark_result,
+        "fraction_of_supported_ops": getattr(model, "fraction_of_supported_ops", None),
+    }
+    if sequence_length and input_ids_length:
+        export_dict["sequence_length"] = sequence_length
+        export_dict["input_ids_length"] = input_ids_length
+
+    # Export results
+    if export_path:
+        _LOGGER.info("Saving benchmark results to JSON file at {}".format(export_path))
+        with open(export_path, "w") as out:
+            json.dump(export_dict, out, indent=2)
+    return export_dict
+
+
+def main():
+    args = parse_args()
+
+    result = benchmark_model(
+        model_path=args.model_path,
+        batch_size=args.batch_size,
+        input_shapes=args.input_shapes,
+        num_cores=args.num_cores,
+        scenario=args.scenario,
+        time=args.time,
+        warmup_time=args.warmup_time,
         num_streams=args.num_streams,
+        sequence_length=args.sequence_length,
+        input_ids_length=args.input_ids_length,
+        thread_pinning=args.thread_pinning,
+        engine=args.engine,
+        internal_kv_cache=not args.no_internal_kv_cache,
+        quiet=args.quiet,
+        export_path=args.export_path,
+        disable_kv_cache_overrides=args.disable_kv_cache_overrides,
+        num_kv_cache_tokens=args.num_kv_cache_tokens,
     )
 
     # Results summary
-    print("Original Model Path: {}".format(orig_model_path))
+    print("Original Model Path: {}".format(args.model_path))
     print("Batch Size: {}".format(args.batch_size))
-    print("Scenario: {}".format(scenario))
-    print("Throughput (items/sec): {:.4f}".format(benchmark_result["items_per_sec"]))
-    print("Latency Mean (ms/batch): {:.4f}".format(benchmark_result["mean"]))
-    print("Latency Median (ms/batch): {:.4f}".format(benchmark_result["median"]))
-    print("Latency Std (ms/batch): {:.4f}".format(benchmark_result["std"]))
-    print("Iterations: {}".format(int(benchmark_result["iterations"])))
-
-    if args.export_path:
-        # Export results
-        print("Saving benchmark results to JSON file at {}".format(args.export_path))
-        export_dict = {
-            "engine": str(model),
-            "orig_model_path": orig_model_path,
-            "model_path": args.model_path,
-            "batch_size": args.batch_size,
-            "input_shapes": args.input_shapes,
-            "num_cores": args.num_cores,
-            "scenario": args.scenario,
-            "scheduler": str(model.scheduler),
-            "seconds_to_run": args.time,
-            "num_streams": args.num_streams,
-            "benchmark_result": benchmark_result,
-        }
-        with open(args.export_path, "w") as out:
-            json.dump(export_dict, out, indent=2)
+    if args.sequence_length:
+        print("Sequence Length: {}".format(args.sequence_length))
+        print("Input IDs Length: {}".format(args.input_ids_length))
+    print("Scenario: {}".format(args.scenario))
+    print(
+        "Throughput (items/sec): {:.4f}".format(
+            result["benchmark_result"]["items_per_sec"]
+        )
+    )
+    print("Latency Mean (ms/batch): {:.4f}".format(result["benchmark_result"]["mean"]))
+    print(
+        "Latency Median (ms/batch): {:.4f}".format(result["benchmark_result"]["median"])
+    )
+    print("Latency Std (ms/batch): {:.4f}".format(result["benchmark_result"]["std"]))
+    print("Iterations: {}".format(int(result["benchmark_result"]["iterations"])))
 
 
 if __name__ == "__main__":

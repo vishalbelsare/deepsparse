@@ -11,3 +11,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# flake8: noqa
+
+from deepsparse.analytics import deepsparse_analytics as _analytics
+
+
+try:
+    import torchvision as _torchvision
+
+    import cv2 as _cv2
+except ImportError:
+    raise ImportError("Please install deepsparse[yolo] to use this pathway")
+
+from .annotate import *
+from .pipelines import *
+from .schemas import *
+
+
+_analytics.send_event("python__yolov5__init")

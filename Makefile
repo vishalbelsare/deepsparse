@@ -8,17 +8,20 @@ DOCDIR := docs
 MDCHECKGLOBS := 'docs/**/*.md' 'docs/**/*.rst' 'examples/**/*.md' 'scripts/**/*.md'
 MDCHECKFILES := CODE_OF_CONDUCT.md CONTRIBUTING.md DEVELOPING.md README.md
 SPARSEZOO_TEST_MODE := "true"
+NM_DISABLE_ANALYTICS := "true"
 
-TARGETS := ""  # targets for running pytests: cli,examples
+TARGETS := ""  # targets for running pytests: cli,nobase
 PYTEST_ARGS ?= ""
 ifneq ($(findstring cli,$(TARGETS)),cli)
-	PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/test_benchmark.py \
+	PYTEST_ARGS += --ignore tests/test_benchmark.py \
 	--ignore tests/test_check_hardware.py \
-	--ignore tests/test_run_inference.py \
-	--ignore tests/test_server.py
+	--ignore tests/test_run_inference.py
 endif
-ifneq ($(findstring examples,$(TARGETS)),examples)
-	PYTEST_ARGS := $(PYTEST_ARGS) --ignore tests/test_examples.py
+ifeq ($(findstring nobase,$(TARGETS)),nobase)
+	PYTEST_ARGS += --ignore tests/deepsparse \
+	--ignore tests/utils/test_data.py \
+	--ignore tests/test_engine.py \
+	--ignore tests/test_multi_engine.py
 endif
 
 PYTHON := python3
@@ -42,10 +45,20 @@ style:
 	isort $(CHECKDIRS);
 
 
+# pull the latest engine binaries from the artifact store
+artifacts:
+	@echo "Running update binaries from artifact store";
+	$(PYTHON) utils/artifacts.py src/deepsparse --force
+
 # run tests for the repo
 test:
 	@echo "Running python tests";
-	@SPARSEZOO_TEST_MODE="true" pytest ./tests/ $(PYTEST_ARGS);
+	@SPARSEZOO_TEST_MODE="true" NM_DISABLE_ANALYTICS="true" pytest tests/ --ignore integrations $(PYTEST_ARGS);
+
+# run integrations tests for the repo
+test_integrations:
+	@echo "Running package integrations tests";
+	@SPARSEZOO_TEST_MODE="true" NM_DISABLE_ANALYTICS="true" pytest integrations/ --ignore tests $(PYTEST_ARGS);
 
 # create docs
 docs:

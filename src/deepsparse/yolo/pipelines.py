@@ -13,15 +13,22 @@
 # limitations under the License.
 
 import json
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 import numpy
 import onnx
 
-from deepsparse.pipeline import Pipeline
+from deepsparse.legacy.pipeline import Pipeline
 from deepsparse.utils import model_to_path
 from deepsparse.yolo.schemas import YOLOInput, YOLOOutput
-from deepsparse.yolo.utils import COCO_CLASSES, YoloPostprocessor, postprocess_nms
+from deepsparse.yolo.utils import (
+    COCO_CLASSES,
+    YoloPostprocessor,
+    get_onnx_expected_image_shape,
+    modify_yolo_onnx_input_shape,
+    postprocess_nms,
+    yolo_onnx_has_postprocessing,
+)
 
 
 try:
@@ -32,6 +39,8 @@ except ModuleNotFoundError as cv2_import_error:
     cv2 = None
     cv2_error = cv2_import_error
 
+__all__ = ["YOLOPipeline"]
+
 
 @Pipeline.register(
     task="yolo",
@@ -41,32 +50,45 @@ except ModuleNotFoundError as cv2_import_error:
 )
 class YOLOPipeline(Pipeline):
     """
-    Image Segmentation YOLO pipeline for DeepSparse
+    Image detection YOLO pipeline for DeepSparse
 
     :param model_path: path on local system or SparseZoo stub to load the model from
-    :param engine_type: inference engine to use. Currently supported values include
-        'deepsparse' and 'onnxruntime'. Default is 'deepsparse'
+    :param engine_type: inference engine to use. Currently, supported values
+        include 'deepsparse' and 'onnxruntime'. Default is 'deepsparse'
     :param batch_size: static batch size to use for inference. Default is 1
     :param num_cores: number of CPU cores to allocate for inference engine. None
         specifies all available cores. Default is None
     :param scheduler: (deepsparse only) kind of scheduler to execute with.
         Pass None for the default
-    :param input_shapes: list of shapes to set ONNX the inputs to. Pass None
+    :param input_shapes: list of shapes to set ONNX inputs to. Pass None
         to use model as-is. Default is None
     :param alias: optional name to give this pipeline instance, useful when
         inferencing with multiple models. Default is None
     :param class_names: Optional string identifier, dict, or json file of
         class names to use for mapping class ids to class labels. Default is
         `coco`
+    :param image_size: optional image size to override with model shape. Can
+        be an int which will be the size for both dimensions, or a 2-tuple
+        of the width and height sizes. Default does not modify model image shape
     """
 
     def __init__(
         self,
         *,
-        class_names: Optional[Union[str, Dict[str, str]]] = "coco",
+        class_names: Optional[Union[str, Dict[str, str]]] = None,
         model_config: Optional[str] = None,
+        image_size: Union[int, Tuple[int, int], None] = None,
+        nms_function: Callable[
+            [Union["torch.Tensor", numpy.ndarray], float, float, bool],  # noqa F821
+            List[numpy.ndarray],
+        ] = postprocess_nms,
         **kwargs,
     ):
+
+        self._image_size = image_size
+        self.nms_function = nms_function
+        self._onnx_temp_file = None  # placeholder for potential tmpfile reference
+
         super().__init__(
             **kwargs,
         )
@@ -86,22 +108,16 @@ class YOLOPipeline(Pipeline):
                 str(index): class_name for index, class_name in enumerate(class_names)
             }
         else:
-            raise ValueError(
-                "class_names must be a str identifier, dict, json file, or "
-                f"list of class names got {type(class_names)}"
-            )
+            self._class_names = None
 
         onnx_model = onnx.load(self.onnx_file_path)
-        self.has_postprocessing = self.model_has_postprocessing(
-            loaded_onnx_model=onnx_model,
-        )
-        self.input_shape = self._infer_image_shape(onnx_model=onnx_model)
+        self.has_postprocessing = yolo_onnx_has_postprocessing(onnx_model)
         self.is_quantized = self.model_is_quantized(onnx_model=onnx_model)
         self.postprocessor = (
             None
             if self.has_postprocessing
             else YoloPostprocessor(
-                image_size=self.input_shape,
+                image_size=self.image_size,
                 cfg=model_config,
             )
         )
@@ -114,6 +130,13 @@ class YOLOPipeline(Pipeline):
     @property
     def class_names(self) -> Optional[Dict[str, str]]:
         return self._class_names
+
+    @property
+    def image_size(self) -> Tuple[int, int]:
+        """
+        :return: shape of image size inference is run at
+        """
+        return self._image_size
 
     @property
     def input_schema(self) -> Type[YOLOInput]:
@@ -137,42 +160,166 @@ class YOLOPipeline(Pipeline):
 
         :return: file path to the ONNX file for the engine to compile
         """
-        return model_to_path(self.model_path)
+        model_path = model_to_path(self.model_path)
+        if self._image_size is None:
+            self._image_size = get_onnx_expected_image_shape(onnx.load(model_path))
+            if self._image_size == (0, 0):
+                raise ValueError(
+                    "The model does not have a static image size shape. "
+                    "Specify the expected image size by passing the"
+                    "`image_size` argument to the pipeline."
+                )
+        else:
+            # override model input shape to given image size
+            if isinstance(self._image_size, int):
+                self._image_size = (self._image_size, self._image_size)
+            self._image_size = self._image_size[:2]
+            model_path, self._onnx_temp_file = modify_yolo_onnx_input_shape(
+                model_path, self._image_size
+            )
+        return model_path
 
-    def process_inputs(self, inputs: YOLOInput) -> List[numpy.ndarray]:
+    def process_inputs(
+        self, inputs: YOLOInput
+    ) -> Tuple[List[numpy.ndarray], Dict[str, Any]]:
         """
         :param inputs: inputs to the pipeline. Must be the type of the `input_schema`
             of this pipeline
         :return: inputs of this model processed into a list of numpy arrays that
             can be directly passed into the forward pass of the pipeline engine
         """
-        # Noting that if numpy arrays are passed in, we assume they are
-        # already the correct shape
+        # Noting that if a batch of numpy arrays are passed in, we assume they
+        # are already the correct shape
 
-        image_batch = []
+        if isinstance(inputs.images, (str, numpy.ndarray)):
+            inputs.images = [inputs.images]
 
-        for image in inputs.images:
-            if isinstance(image, list):
-                # image consists of floats or ints
-                image = numpy.asarray(image)
+        image_batch = list(self.executor.map(self._preprocess_image, inputs.images))
 
-            if isinstance(image, str):
-                image = cv2.imread(image)
-                image = cv2.resize(image, dsize=self.input_shape)
-
-            image = self._make_channels_first(image)
-            image_batch.append(image)
+        original_image_shapes = None
+        if image_batch and isinstance(image_batch[0], tuple):
+            # splits image batch is of format:
+            #  [(preprocesses_img, original_image_shape), ...] into separate lists
+            image_batch, original_image_shapes = list(map(list, zip(*image_batch)))
 
         image_batch = self._make_batch(image_batch)
         image_batch = numpy.ascontiguousarray(
             image_batch,
-            dtype=numpy.int8 if self.is_quantized else numpy.float32,
+            dtype=numpy.uint8 if self.is_quantized else numpy.float32,
         )
 
         if not self.is_quantized:
             image_batch /= 255
+        postprocessing_kwargs = dict(
+            iou_thres=inputs.iou_thres,
+            conf_thres=inputs.conf_thres,
+            multi_label=inputs.multi_label,
+            original_image_shapes=original_image_shapes,
+            return_masks=inputs.return_masks,
+            return_intermediate_outputs=inputs.return_intermediate_outputs,
+        )
+        return [image_batch], postprocessing_kwargs
 
-        return [image_batch]
+    def _scale_boxes(
+        self, boxes: numpy.ndarray, original_image_shape: Optional[Tuple[int, ...]]
+    ) -> numpy.ndarray:
+        if not original_image_shape:
+            return boxes
+
+        scale = numpy.flipud(
+            numpy.divide(
+                numpy.asarray(original_image_shape), numpy.asarray(self.image_size)
+            )
+        )
+
+        # scale is originally np.array([x_scale, y_scale]), needs to be
+        #  np.array([x_scale, y_scale, x_scale, y_scale])
+        #  to allow broadcasting with bbox(s) with shape (num_bboxes, 4)
+        scale = numpy.concatenate([scale, scale])
+        boxes = numpy.multiply(boxes, scale)
+        return boxes
+
+    def _preprocess_image(self, image) -> Tuple[numpy.ndarray, Tuple[int, ...]]:
+        if isinstance(image, list):
+            # image consists of floats or ints
+            image = numpy.asarray(image)
+
+        if isinstance(image, str):
+            image = cv2.imread(image)
+
+        image = self._make_channels_last(image)
+
+        # extract (H, W) shapes from (H, W, C) and (B, H, W, C) shaped input
+        original_image_shape = image.shape[:2] if image.ndim == 3 else image.shape[1:-1]
+
+        if image.ndim < 4:
+            # Assume a batch is of the correct size already
+            image = cv2.resize(image, dsize=tuple(reversed(self.image_size)))
+
+        image = self._make_channels_first(image)
+        return image, original_image_shape
+
+    def process_engine_outputs(
+        self,
+        engine_outputs: List[numpy.ndarray],
+        **kwargs,
+    ) -> YOLOOutput:
+        """
+        :param engine_outputs: list of numpy arrays that are the output of the engine
+            forward pass
+        :return: outputs of engine post-processed into an object in the `output_schema`
+            format of this pipeline
+        """
+
+        # post-processing
+        if self.postprocessor:
+            batch_output = self.postprocessor.pre_nms_postprocess(engine_outputs)
+        else:
+            batch_output = engine_outputs[
+                0
+            ]  # post-processed values stored in first output
+
+        # NMS
+        batch_output = self.nms_function(
+            outputs=batch_output,
+            iou_thres=kwargs.get("iou_thres", 0.25),
+            conf_thres=kwargs.get("conf_thres", 0.45),
+            multi_label=kwargs.get("multi_label", False),
+        )
+
+        batch_boxes, batch_scores, batch_labels = [], [], []
+
+        original_image_shapes = kwargs.get("original_image_shapes")
+        for idx, image_output in enumerate(batch_output):
+            original_image_shape = (
+                original_image_shapes[idx] if idx < len(original_image_shapes) else None
+            )
+            batch_boxes.append(
+                self._scale_boxes(
+                    boxes=image_output[:, 0:4],
+                    original_image_shape=original_image_shape,
+                ).tolist(),
+            )
+            batch_scores.append(image_output[:, 4].tolist())
+            batch_labels.append(image_output[:, 5].tolist())
+            if self.class_names is not None:
+                batch_labels_as_strings = [
+                    str(int(label)) for label in batch_labels[-1]
+                ]
+                batch_class_names = [
+                    self.class_names[label_string]
+                    for label_string in batch_labels_as_strings
+                ]
+                batch_labels[-1] = batch_class_names
+
+        return YOLOOutput(
+            boxes=batch_boxes,
+            scores=batch_scores,
+            labels=batch_labels,
+            intermediate_outputs=engine_outputs[0]
+            if kwargs.get("return_intermediate_outputs")
+            else None,
+        )
 
     def _make_batch(self, image_batch: List[numpy.ndarray]) -> numpy.ndarray:
         # return a numpy batch of images
@@ -199,59 +346,21 @@ class YOLOPipeline(Pipeline):
 
         return image
 
-    def process_engine_outputs(
-        self,
-        engine_outputs: List[numpy.ndarray],
-    ) -> YOLOOutput:
-        """
-        :param engine_outputs: list of numpy arrays that are the output of the engine
-            forward pass
-        :return: outputs of engine post-processed into an object in the `output_schema`
-            format of this pipeline
-        """
+    def _make_channels_last(self, image: numpy.ndarray) -> numpy.ndarray:
+        # return a numpy array with channels first
+        is_single_image = image.ndim == 3
+        is_batch = image.ndim == 4
 
-        # post-processing
-        if self.postprocessor:
-            batch_output = self.postprocessor.pre_nms_postprocess(engine_outputs)
-        else:
-            batch_output = engine_outputs[
-                0
-            ]  # post-processed values stored in first output
+        if image.shape[-1] == 3:
+            return image
 
-        # NMS
-        batch_output = postprocess_nms(batch_output)
+        if is_single_image:
+            return numpy.moveaxis(image, 0, -1)
 
-        batch_predictions, batch_boxes, batch_scores, batch_labels = [], [], [], []
+        if is_batch:
+            return numpy.moveaxis(image, 1, -1)
 
-        for image_output in batch_output:
-            batch_predictions.append(image_output.tolist())
-            batch_boxes.append(image_output[:, 0:4].tolist())
-            batch_scores.append(image_output[:, 4].tolist())
-            batch_labels.append(
-                [
-                    self.class_names[str(class_ids)]
-                    for class_ids in image_output[:, 5].astype(int)
-                ]
-            )
-
-        return YOLOOutput(
-            predictions=batch_predictions,
-            boxes=batch_boxes,
-            scores=batch_scores,
-            labels=batch_labels,
-        )
-
-    def _infer_image_shape(self, onnx_model) -> Tuple[int, ...]:
-        """
-        Infer and return the expected shape of the input tensor
-
-        :return: The expected shape of the input tensor from onnx graph
-        """
-        input_tensor = onnx_model.graph.input[0]
-        return (
-            input_tensor.type.tensor_type.shape.dim[2].dim_value,
-            input_tensor.type.tensor_type.shape.dim[3].dim_value,
-        )
+        return image
 
     def model_has_postprocessing(self, loaded_onnx_model) -> bool:
         """

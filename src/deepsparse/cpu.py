@@ -18,8 +18,10 @@ Functionality for detecting the details of the currently available cpu
 
 import json
 import os
+import platform
 import subprocess
 import sys
+from distutils.version import StrictVersion
 from typing import Any, Tuple
 
 
@@ -31,12 +33,15 @@ __all__ = [
     "cpu_vnni_compatible",
     "cpu_avx2_compatible",
     "cpu_avx512_compatible",
+    "cpu_neon_compatible",
+    "cpu_sve_compatible",
     "cpu_quantization_compatible",
     "print_hardware_capability",
 ]
 
 
-VALID_VECTOR_EXTENSIONS = {"avx2", "avx512"}
+VALID_VECTOR_EXTENSIONS = {"avx2", "avx512", "neon", "sve"}
+MINIMUM_DARWIN_VERSION = "13.0.0"
 
 
 class _Memoize:
@@ -124,24 +129,52 @@ def _parse_arch_bin() -> architecture:
     package_path = os.path.dirname(os.path.realpath(__file__))
     file_path = os.path.join(package_path, "arch.bin")
 
+    error_msg = "Neural Magic: Encountered exception while trying to read arch.bin: {}"
+
     try:
         info_str = subprocess.check_output(file_path).decode("utf-8")
         return architecture(json.loads(info_str))
 
     except subprocess.CalledProcessError as ex:
         error = json.loads(ex.stdout)
-        raise OSError(
-            "Neural Magic: Encountered exception while trying read arch.bin: {}".format(
-                error["error"]
-            )
-        )
+        raise OSError(error_msg.format(error["error"]))
 
     except Exception as ex:
-        raise OSError(
-            "Neural Magic: Encountered exception while trying read arch.bin: {}".format(
-                ex
-            )
-        )
+        raise OSError(error_msg.format(ex))
+
+
+def get_darwin_version() -> str:
+    """
+    If we are running Darwin, get the current version.  Otherwise return None.
+    """
+    if sys.platform.startswith("darwin"):
+        return platform.mac_ver()[0]
+    return None
+
+
+def check_darwin_support() -> bool:
+    """
+    Check if the system is running Darwin and it meets the minimum version
+    requirements.
+    """
+    if sys.platform.startswith("darwin"):
+        ver = get_darwin_version()
+        return StrictVersion(ver) >= StrictVersion(MINIMUM_DARWIN_VERSION)
+    return False
+
+
+def platform_error_msg() -> str:
+    """
+    Generate unsupported platform error message.
+    """
+    darwin_str = f" or MacOS >= {MINIMUM_DARWIN_VERSION}"
+    darwin_ver = get_darwin_version()
+    if darwin_ver:
+        current_os = f"MacOS {darwin_ver}"
+    else:
+        current_os = sys.platform
+
+    return f"Neural Magic: Only Linux{darwin_str} is supported, not '{current_os}'."
 
 
 def cpu_architecture() -> architecture:
@@ -159,10 +192,8 @@ def cpu_architecture() -> architecture:
 
     :return: an instance of the architecture class
     """
-    if not sys.platform.startswith("linux"):
-        raise OSError(
-            "Neural Magic: Only Linux is supported, not '{}'.".format(sys.platform)
-        )
+    if not (sys.platform.startswith("linux") or check_darwin_support()):
+        raise OSError(platform_error_msg())
 
     arch = _parse_arch_bin()
     isa_type_override = os.getenv("NM_ARCH", None)
@@ -217,13 +248,34 @@ def cpu_avx2_compatible() -> bool:
     return cpu_architecture().isa == "avx2" or cpu_avx512_compatible()
 
 
+def cpu_neon_compatible() -> bool:
+    """
+    :return: True if the current cpu has the NEON instruction set,
+        used for running neural networks performantly
+    """
+    return cpu_architecture().isa == "neon"
+
+
+def cpu_sve_compatible() -> bool:
+    """
+    :return: True if the current cpu has the SVE instruction set,
+        used for running neural networks performantly
+    """
+    return cpu_architecture().isa == "sve"
+
+
 def cpu_quantization_compatible() -> bool:
     """
-    :return: True if the current cpu has the AVX2 or AVX512 instruction sets,
+    :return: True if the current cpu has the AVX2, AVX512, NEON or SVE instruction sets,
         used for running quantized neural networks performantly.
         (AVX2 < AVX512 < VNNI)
     """
-    return cpu_avx2_compatible() or cpu_avx512_compatible()
+    return (
+        cpu_avx2_compatible()
+        or cpu_avx512_compatible()
+        or cpu_neon_compatible()
+        or cpu_sve_compatible()
+    )
 
 
 def cpu_details() -> Tuple[int, str, bool]:
@@ -255,32 +307,39 @@ def print_hardware_capability():
     arch = cpu_architecture()
 
     quantized_flag = "TRUE (emulated)" if cpu_quantization_compatible() else "FALSE"
-    if cpu_vnni_compatible():
+    if cpu_vnni_compatible() or cpu_neon_compatible() or cpu_sve_compatible():
         quantized_flag = "TRUE"
+
+    fp32_flag = (
+        cpu_avx2_compatible()
+        or cpu_avx512_compatible()
+        or cpu_neon_compatible()
+        or cpu_sve_compatible()
+    )
 
     message = (
         f"{arch.vendor} CPU detected with {arch.num_available_physical_cores} cores. "
         f"({arch.available_sockets} sockets with "
         f"{arch.available_cores_per_socket} cores each)\n"
-        "DeepSparse FP32 model performance supported: "
-        f"{cpu_avx2_compatible() or cpu_avx512_compatible()}.\n"
+        f"DeepSparse FP32 model performance supported: {fp32_flag}.\n"
         "DeepSparse INT8 (quantized) model performance supported: "
         f"{quantized_flag}.\n\n"
     )
 
-    if cpu_avx2_compatible() and not cpu_avx512_compatible():
-        message += (
-            "AVX2 instruction set detected. Performance speedups are available, "
-            "but inference time will be slower compared with an AVX-512 system.\n\n"
-        )
+    if not (cpu_neon_compatible() or cpu_sve_compatible()):
+        if cpu_avx2_compatible() and not cpu_avx512_compatible():
+            message += (
+                "AVX2 instruction set detected. Performance speedups are available, "
+                "but inference time will be slower compared with an AVX-512 system.\n\n"
+            )
 
-    if cpu_quantization_compatible() and not cpu_vnni_compatible():
-        message += (
-            "Non VNNI system detected. Performance speedups for INT8 (quantized) "
-            "models is available, but will be slower compared with a VNNI system. "
-            "Set NM_FAST_VNNI_EMULATION=True in the environment to enable faster "
-            "emulated inference which may have a minor effect on accuracy.\n\n"
-        )
+        if cpu_quantization_compatible() and not cpu_vnni_compatible():
+            message += (
+                "Non VNNI system detected. Performance speedups for INT8 (quantized) "
+                "models is available, but will be slower compared with a VNNI system. "
+                "Set NM_FAST_VNNI_EMULATION=True in the environment to enable faster "
+                "emulated inference which may have a minor effect on accuracy.\n\n"
+            )
 
     message += f"Additional CPU info: {arch}"
     print(message)

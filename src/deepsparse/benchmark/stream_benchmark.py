@@ -15,32 +15,54 @@
 import queue
 import threading
 import time
-from typing import Dict, List
+from typing import Any, Dict, List, NamedTuple
 
-import numpy as np
+import numpy
 
 from deepsparse import Engine
+
+
+try:
+    # flake8: noqa
+    from deepsparse.lib import init_deepsparse_lib
+except ImportError:
+    raise ImportError(
+        "Unable to import deepsparse python apis. "
+        "Please contact support@neuralmagic.com"
+    )
 
 
 __all__ = ["model_stream_benchmark"]
 
 
-def iteration(model: Engine, input: List[np.ndarray]):
-    start = time.time()
-    output = model.run(input, val_inp=False)
-    end = time.time()
+LIB = init_deepsparse_lib()
+
+
+class _InputAndCache(NamedTuple):
+    input: List[numpy.ndarray]
+    kv_cache: Any
+
+
+def iteration(model: Engine, input: List[numpy.ndarray]):
+    start = time.perf_counter()
+    if not isinstance(input, _InputAndCache):
+        output = model.run(input, val_inp=False)
+    else:
+        # run with internal kv cache object
+        output = model._eng_net.execute_list_out(input.input, input.kv_cache)
+    end = time.perf_counter()
     return output, start, end
 
 
 def singlestream_benchmark(
     model: Engine,
-    input_list: List[np.ndarray],
+    input_list: List[numpy.ndarray],
     seconds_to_run: float,
 ) -> List[float]:
     batch_times = []
 
-    stream_end_time = time.time() + seconds_to_run
-    while time.time() < stream_end_time:
+    stream_end_time = time.perf_counter() + seconds_to_run
+    while time.perf_counter() < stream_end_time:
         _, start, end = iteration(model, input_list)
         batch_times.append([start, end])
 
@@ -51,7 +73,7 @@ class EngineExecutorThread(threading.Thread):
     def __init__(
         self,
         model: Engine,
-        input_list: List[np.ndarray],
+        input_list: List[numpy.ndarray],
         time_queue: queue.Queue,
         max_time: float,
     ):
@@ -62,19 +84,19 @@ class EngineExecutorThread(threading.Thread):
         self._max_time = max_time
 
     def run(self):
-        while time.time() < self._max_time:
+        while time.perf_counter() < self._max_time:
             _, start, end = iteration(self._model, self._input_list)
             self._time_queue.put([start, end])
 
 
 def multistream_benchmark(
     model: Engine,
-    input_list: List[np.ndarray],
+    input_list: List[numpy.ndarray],
     seconds_to_run: float,
     num_streams: int,
 ) -> List[float]:
     time_queue = queue.Queue()
-    max_time = time.time() + seconds_to_run
+    max_time = time.perf_counter() + seconds_to_run
     threads = []
 
     for thread in range(num_streams):
@@ -91,24 +113,33 @@ def multistream_benchmark(
 
 def model_stream_benchmark(
     model: Engine,
-    input_list: List[np.ndarray],
+    input_list: List[numpy.ndarray],
     scenario: str,
     seconds_to_run: float,
     seconds_to_warmup: float,
     num_streams: int,
+    internal_kv_cache: bool = False,
 ) -> Dict:
 
-    # Warmup the engine for a second
-    singlestream_benchmark(model, input_list, seconds_to_warmup)
+    if internal_kv_cache:
+        kv_cache = LIB.kv_cache(0, 0)  # fake KV cache object
+        input_list = _adjust_input_list_for_internal_kv_cache(
+            input_list, model.input_names
+        )
+        input_list = _InputAndCache(input=input_list, kv_cache=kv_cache)
 
-    # Run the benchmark scenario and collect batch times
+    # Run the benchmark scenario and collect batch times. The engine will be warmed up
+    # for a few seconds first using "seconds_to_warmup"
     if scenario == "singlestream":
+        singlestream_benchmark(model, input_list, seconds_to_warmup)
         batch_times = singlestream_benchmark(model, input_list, seconds_to_run)
     elif scenario == "multistream":
+        multistream_benchmark(model, input_list, seconds_to_warmup, num_streams)
         batch_times = multistream_benchmark(
             model, input_list, seconds_to_run, num_streams
         )
     elif scenario == "elastic":
+        multistream_benchmark(model, input_list, seconds_to_warmup, num_streams)
         batch_times = multistream_benchmark(
             model, input_list, seconds_to_run, num_streams
         )
@@ -130,14 +161,14 @@ def model_stream_benchmark(
     # given amount of wallclock time. This calculation as-is includes the test overhead
     # such as saving timing results for each iteration so it isn't a best-case but is a
     # realistic case.
-    first_start_time = min([b[0] for b in batch_times])
-    last_end_time = max([b[1] for b in batch_times])
+    first_start_time = min(b[0] for b in batch_times)
+    last_end_time = max(b[1] for b in batch_times)
     total_time_executing = last_end_time - first_start_time
 
     items_per_sec = (model.batch_size * len(batch_times)) / total_time_executing
 
     percentiles = [25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9]
-    buckets = np.percentile(batch_times_ms, percentiles).tolist()
+    buckets = numpy.percentile(batch_times_ms, percentiles).tolist()
     percentiles_dict = {
         "{:2.1f}%".format(key): value for key, value in zip(percentiles, buckets)
     }
@@ -146,9 +177,21 @@ def model_stream_benchmark(
         "items_per_sec": items_per_sec,
         "seconds_ran": total_time_executing,
         "iterations": len(batch_times_ms),
-        "median": np.median(batch_times_ms),
-        "mean": np.mean(batch_times_ms),
-        "std": np.std(batch_times_ms),
+        "median": numpy.median(batch_times_ms),
+        "mean": numpy.mean(batch_times_ms),
+        "std": numpy.std(batch_times_ms),
         **percentiles_dict,
     }
     return benchmark_dict
+
+
+def _adjust_input_list_for_internal_kv_cache(input_list, input_names):
+    # if detecting a cached input (using 'past_key_values'),
+    # set the sample input size to effective 0 for internal cache benchmarking
+    updated_inputs = []
+    for name, inputs in zip(input_names, input_list):
+        if name.startswith("past_key_values"):
+            # set batch dim to 0 to match pipeline execution
+            inputs = numpy.zeros_like(inputs, shape=(0, *inputs.shape[1:]))
+        updated_inputs.append(inputs)
+    return updated_inputs

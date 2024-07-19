@@ -30,19 +30,21 @@ __all__ = [
     "version_major_minor",
     "splash",
     "is_release",
+    "is_enterprise",
 ]
 
 
 try:
     # check for the backend's built version file, if it exists use that for version info
-    from deepsparse.generated_version import is_release, splash, version
+    from deepsparse.generated_version import is_enterprise, is_release, splash, version
 except Exception:
     # otherwise, fall back to version info in this file
-    version = "0.13.0"
+    version = "1.8.0"
     is_release = False
+    is_enterprise = False
     splash = (
         "DeepSparse Engine, Copyright 2021-present / Neuralmagic, Inc. "
-        f"version: {version} (release)"
+        f"version: {version} COMMUNITY EDITION (release)"
     )
 
 __version__ = version

@@ -15,23 +15,23 @@
 """
 Input/Output Schemas for Image Classification.
 """
-
-from typing import Any, List, Union
+from typing import List, Union
 
 from pydantic import BaseModel, Field
 
+from deepsparse.pipelines.computer_vision import ComputerVisionSchema
 
-class ImageClassificationInput(BaseModel):
+
+__all__ = [
+    "ImageClassificationInput",
+    "ImageClassificationOutput",
+]
+
+
+class ImageClassificationInput(ComputerVisionSchema):
     """
     Input model for image classification
     """
-
-    images: Union[str, List[str], List[Any]] = Field(
-        description="List of Images to process"
-    )
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class ImageClassificationOutput(BaseModel):
@@ -39,7 +39,9 @@ class ImageClassificationOutput(BaseModel):
     Output model for image classification
     """
 
-    labels: List[Union[int, str]] = Field(
+    labels: List[Union[int, str, List[int], List[str]]] = Field(
         description="List of labels, one for each prediction"
     )
-    scores: List[float] = Field(description="List of scores, one for each prediction")
+    scores: List[Union[float, List[float]]] = Field(
+        description="List of scores, one for each prediction"
+    )

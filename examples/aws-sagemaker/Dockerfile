@@ -19,12 +19,12 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 RUN python3 -m venv $VIRTUAL_ENV && \
     pip3 install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir "deepsparse-nightly[server]"  # TODO: switch to deepsparse[server] >= 0.12
+    pip3 install deepsparse[transformers,server]>=1.5.2
 
 # create 'serve' command for sagemaker entrypoint
 RUN mkdir /opt/server/
 RUN echo "#! /bin/bash" > /opt/server/serve
-RUN echo "deepsparse.server --port 8080 --config_file /root/server-config.yaml" >> /opt/server/serve
+RUN echo "deepsparse.server config --port 8080 /root/server-config.yaml" >> /opt/server/serve
 RUN chmod 777 /opt/server/serve
 
 ENV PATH="/opt/server:${PATH}"

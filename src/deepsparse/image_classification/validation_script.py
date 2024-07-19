@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Usage: validation_script.py [OPTIONS]
+Usage: deepsparse.image_classification.eval [OPTIONS]
 
   Validation Script for Image Classification Models
 
@@ -23,14 +23,27 @@ Options:
   --model-path, --model_path TEXT
                                   Path/SparseZoo stub for the Image
                                   Classification model to be evaluated.
-                                  Defaults to resnet50 trained on
-                                  Imagenette  [default: zoo:cv/classification/
-                                  resnet_v1-50/pytorch/sparseml/imagenette/
+                                  Defaults to dense (vanilla) resnet50 trained
+                                  on Imagenette  [default: zoo:cv/classificati
+                                  on/resnet_v1-50/pytorch/sparseml/imagenette/
                                   base-none]
+  --image-size, --image_size INTEGER
+                                  integer size to evaluate images at (will be
+                                  reshaped to square shape)  [default: 224]
   --batch-size, --batch_size INTEGER
                                   Test batch size, must divide the dataset
-                                  evenly, else the last batch will be dropped
+                                  evenly, else last batch will be dropped
                                   [default: 1]
+  --num-cores, --num_cores INTEGER
+                                  Number of CPU cores to run deepsparse with,
+                                  default is all available
+  --dataset-kwargs, --dataset_kwargs TEXT
+                                  Keyword arguments to be passed to dataset
+                                  constructor, should be specified as a json
+  --engine [deepsparse|onnxruntime]
+                                  engine type to use, valid choices:
+                                  ['deepsparse', 'onnxruntime']  [default:
+                                  deepsparse]
   --help                          Show this message and exit.
 
 #########
@@ -43,29 +56,42 @@ python validation_script.py \
   --dataset-path /path/to/imagenette/
 
 """
-from tqdm import tqdm
-
-from deepsparse.pipeline import Pipeline
-from torch.utils.data import DataLoader
-from torchvision import transforms
-
-
-try:
-    import torchvision
-
-except ModuleNotFoundError as torchvision_error:  # noqa: F841
-    print(
-        "Torchvision not installed. Please install it using the command:"
-        "pip install torchvision>=0.3.0,<=0.10.1"
-    )
-    exit(1)
+import json
+from typing import Dict
 
 import click
+import torchvision
+from torchvision import transforms
+from tqdm import tqdm
 
+from deepsparse.image_classification.constants import (
+    IMAGENET_RGB_MEANS,
+    IMAGENET_RGB_STDS,
+)
+from deepsparse.pipeline import Pipeline
+from torch.utils.data import DataLoader
+
+
+DEEPSPARSE_ENGINE = "deepsparse"
+ORT_ENGINE = "onnxruntime"
 
 resnet50_imagenet_pruned = (
     "zoo:cv/classification/resnet_v1-50/pytorch/sparseml/imagenette/base-none"
 )
+
+
+def parse_json_callback(ctx, params, value: str) -> Dict:
+    """
+    Parse a json string into a dictionary
+    :param ctx: The click context
+    :param params: The click params
+    :param value: The json string to parse
+    :return: The parsed dictionary
+    """
+    # JSON string -> dict Callback
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
 
 @click.command()
@@ -100,20 +126,80 @@ resnet50_imagenet_pruned = (
     type=int,
     default=224,
     show_default=True,
-    help="Test batch size, must divide the dataset evenly, else last "
-    "batch will be dropped",
+    help="integer size to evaluate images at (will be reshaped to square shape)",
 )
-def main(dataset_path: str, model_path: str, batch_size: int, image_size: int):
+@click.option(
+    "--num-cores",
+    "--num_cores",
+    type=int,
+    default=None,
+    show_default=True,
+    help="Number of CPU cores to run deepsparse with, default is all available",
+)
+@click.option(
+    "--dataset-kwargs",
+    "--dataset_kwargs",
+    default=json.dumps({}),
+    type=str,
+    callback=parse_json_callback,
+    help="Keyword arguments to be passed to dataset constructor, "
+    "should be specified as a json object",
+)
+@click.option(
+    "--engine",
+    default=DEEPSPARSE_ENGINE,
+    type=click.Choice([DEEPSPARSE_ENGINE, ORT_ENGINE]),
+    show_default=True,
+    help="engine type to use, valid choices: ['deepsparse', 'onnxruntime']",
+)
+def main(
+    dataset_path: str,
+    model_path: str,
+    batch_size: int,
+    image_size: int,
+    num_cores: int,
+    dataset_kwargs: Dict,
+    engine: str,
+):
     """
     Validation Script for Image Classification Models
     """
+
+    if "resize_scale" in dataset_kwargs:
+        resize_scale = dataset_kwargs["resize_scale"]
+    else:
+        resize_scale = 256.0 / 224.0  # standard used
+
+    if "resize_mode" in dataset_kwargs:
+        resize_mode = dataset_kwargs["resize_mode"]
+    else:
+        resize_mode = "bilinear"
+
+    if "rgb_means" in dataset_kwargs:
+        rgb_means = dataset_kwargs["rgb_means"]
+    else:
+        rgb_means = IMAGENET_RGB_MEANS
+
+    if "rgb_stds" in dataset_kwargs:
+        rgb_stds = dataset_kwargs["rgb_stds"]
+    else:
+        rgb_stds = IMAGENET_RGB_STDS
+
+    if type(resize_mode) is str and resize_mode.lower() in ["linear", "bilinear"]:
+        interpolation = transforms.InterpolationMode.BILINEAR
+    elif type(resize_mode) is str and resize_mode.lower() in ["cubic", "bicubic"]:
+        interpolation = transforms.InterpolationMode.BICUBIC
 
     dataset = torchvision.datasets.ImageFolder(
         root=dataset_path,
         transform=transforms.Compose(
             [
+                transforms.Resize(
+                    round(resize_scale * image_size), interpolation=interpolation
+                ),
+                transforms.CenterCrop(image_size),
                 transforms.ToTensor(),
-                transforms.Resize(size=(image_size, image_size)),
+                transforms.Normalize(mean=rgb_means, std=rgb_stds),
             ]
         ),
     )
@@ -127,7 +213,9 @@ def main(dataset_path: str, model_path: str, batch_size: int, image_size: int):
     pipeline = Pipeline.create(
         task="image_classification",
         model_path=model_path,
+        engine_type=engine,
         batch_size=batch_size,
+        num_cores=num_cores,
     )
     correct = total = 0
     progress_bar = tqdm(data_loader)
@@ -140,6 +228,8 @@ def main(dataset_path: str, model_path: str, batch_size: int, image_size: int):
 
         for actual, predicted in zip(actual_labels, predicted_labels):
             total += 1
+            if isinstance(predicted, list):
+                predicted = predicted[0]  # unwrap label returned as list
             if isinstance(predicted, str):
                 predicted = int(predicted)
             if actual.item() == predicted:

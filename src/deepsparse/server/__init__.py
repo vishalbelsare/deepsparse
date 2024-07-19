@@ -19,4 +19,17 @@ DeepSparse server implementation to serve ONNX files and pipelines through
 the DeepSparse Engine.
 """
 
-from .main import start_server
+from deepsparse.analytics import deepsparse_analytics as _analytics
+
+
+try:
+    import uvicorn as _uvicorn
+    from fastapi import FastAPI as _FastAPI
+    from starlette.responses import RedirectResponse as _RedirectResponse
+except ImportError:
+    raise ImportError("Please install deepsparse[server] to use this pathway")
+
+from .cli import main
+
+
+_analytics.send_event("python__server__init")

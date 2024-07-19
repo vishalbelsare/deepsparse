@@ -33,19 +33,18 @@ Pipeline implementation and pydantic models for question answering transformers
 tasks
 """
 
-
-from typing import Any, Dict, List, Tuple, Type
+import collections
+import json
+import logging
+import os
+import warnings
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import numpy
 from pydantic import BaseModel, Field
-from transformers.data import (
-    SquadExample,
-    SquadFeatures,
-    squad_convert_examples_to_features,
-)
-from transformers.tokenization_utils_base import PaddingStrategy
+from transformers.data import SquadExample
 
-from deepsparse import Pipeline
+from deepsparse.legacy import Pipeline
 from deepsparse.transformers.pipelines import TransformersPipeline
 
 
@@ -55,6 +54,8 @@ __all__ = [
     "QuestionAnsweringPipeline",
 ]
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class QuestionAnsweringInput(BaseModel):
     """
@@ -63,6 +64,7 @@ class QuestionAnsweringInput(BaseModel):
 
     question: str = Field(description="String question to be answered")
     context: str = Field(description="String representing context for answer")
+    id: str = Field(description="Sample identifier", default=None)
 
 
 class QuestionAnsweringOutput(BaseModel):
@@ -79,10 +81,7 @@ class QuestionAnsweringOutput(BaseModel):
 @Pipeline.register(
     task="question_answering",
     task_aliases=["qa"],
-    default_model_path=(
-        "zoo:nlp/question_answering/bert-base/pytorch/huggingface/"
-        "squad/12layer_pruned80_quant-none-vnni"
-    ),
+    default_model_path=("zoo:bert-large-squad_wikipedia_bookcorpus-pruned90_quantized"),
 )
 class QuestionAnsweringPipeline(TransformersPipeline):
     """
@@ -96,10 +95,8 @@ class QuestionAnsweringPipeline(TransformersPipeline):
     )
     ```
 
-    :param model_path: sparsezoo stub to a transformers model, an ONNX file, or
-        (preferred) a directory containing a model.onnx, tokenizer config, and model
-        config. If no tokenizer and/or model config(s) are found, then they will be
-        loaded from huggingface transformers using the `default_model_name` key
+    :param model_path: sparsezoo stub to a transformers model or (preferred) a
+        directory containing a model.onnx, tokenizer config, and model config
     :param engine_type: inference engine to use. Currently supported values include
         'deepsparse' and 'onnxruntime'. Default is 'deepsparse'
     :param batch_size: static batch size to use for inference. Default is 1
@@ -112,26 +109,38 @@ class QuestionAnsweringPipeline(TransformersPipeline):
     :param alias: optional name to give this pipeline instance, useful when
         inferencing with multiple models. Default is None
     :param sequence_length: sequence length to compile model and tokenizer for.
-        Default is 128
-    :param default_model_name: huggingface transformers model name to use to
-        load a tokenizer and model config when none are provided in the `model_path`.
-        Default is 'bert-base-uncased'
+        If a list of lengths is provided, then for each length, a model and
+        tokenizer will be compiled capable of handling that sequence length
+        (also known as a bucket). Default is 128
     :param doc_stride: if the context is too long to fit with the question for the
         model, it will be split in several chunks with some overlap. This argument
-        controls the size of that overlap. Currently, only reading the first span
-        is supported (everything after doc_stride will be truncated). Default
-        is 128
-    :param max_question_len: maximum length of the question after tokenization.
+        controls the size of that overlap. Default is 128
+    :param max_question_length: maximum length of the question after tokenization.
         It will be truncated if needed. Default is 64
-    :param max_answer_len: maximum length of answer after decoding. Default is 15
+    :param max_answer_length: maximum length of answer after decoding. Default is 15
+    :param n_best_size: number of n-best predictions to generate when looking for
+        an answer. Default is 20
+    :param pad_to_max_length: whether to pad all samples to max sequence length.
+        If False, will pad the samples dynamically when batching to the maximum length
+        in the batch
+    :param version_2_with_negative: if true, some examples do not have an answer
+    :param output_dir: output folder to save predictions, used for debugging
+    :param num_spans: if the context is too long to fit with the question for the
+        model, it will be split in several chunks. This argument controls the maximum
+        number of spans to feed into the model.
     """
 
     def __init__(
         self,
         *,
-        doc_stride: int = 128,
+        doc_stride: int = 64,
         max_question_length: int = 64,
         max_answer_length: int = 15,
+        n_best_size: int = 20,
+        pad_to_max_length: bool = True,
+        version_2_with_negative: bool = False,
+        output_dir: str = None,
+        num_spans: Optional[int] = None,
         **kwargs,
     ):
 
@@ -144,6 +153,11 @@ class QuestionAnsweringPipeline(TransformersPipeline):
         self._doc_stride = doc_stride
         self._max_question_length = max_question_length
         self._max_answer_length = max_answer_length
+        self._n_best_size = n_best_size
+        self._pad_to_max_length = pad_to_max_length
+        self._version_2_with_negative = version_2_with_negative
+        self._output_dir = output_dir
+        self._num_spans = num_spans
 
         super().__init__(**kwargs)
 
@@ -152,8 +166,7 @@ class QuestionAnsweringPipeline(TransformersPipeline):
         """
         :return: if the context is too long to fit with the question for the
             model, it will be split in several chunks with some overlap. This argument
-            controls the size of that overlap. Currently, only reading the first span
-            is supported (everything after doc_stride will be truncated)
+            controls the size of that overlap.
         """
         return self._doc_stride
 
@@ -165,12 +178,42 @@ class QuestionAnsweringPipeline(TransformersPipeline):
         return self._max_answer_length
 
     @property
+    def n_best_size(self) -> int:
+        """
+        :return: The total number of n-best predictions to generate when looking
+            for an answer
+        """
+        return self._n_best_size
+
+    @property
+    def pad_to_max_length(self) -> int:
+        """
+        :return: whether to pad all samples to max_sequence_length
+        """
+        return self._pad_to_max_length
+
+    @property
     def max_question_length(self) -> int:
         """
         :return: maximum length of the question after tokenization.
             It will be truncated if needed
         """
         return self._max_question_length
+
+    @property
+    def version_2_with_negative(self) -> bool:
+        """
+        :return: Whether or not the underlying dataset contains examples with
+            no answers
+        """
+        return self._version_2_with_negative
+
+    @property
+    def output_dir(self) -> str:
+        """
+        :return: path to output folder for predictions
+        """
+        return self._output_dir
 
     @property
     def input_schema(self) -> Type[BaseModel]:
@@ -198,22 +241,40 @@ class QuestionAnsweringPipeline(TransformersPipeline):
             dictionary of parsed features and original extracted example
         """
         squad_example = SquadExample(
-            None, inputs.question, inputs.context, None, None, None
+            inputs.id, inputs.question, inputs.context, None, None, None
         )
-        features = self._tokenize(squad_example)
-        tokens = features.__dict__
+        tokenized_example = self._tokenize(squad_example)
 
-        engine_inputs = self.tokens_to_engine_input(tokens)
+        span_engine_inputs = []
+        span_extra_info = []
+        num_spans = len(tokenized_example["input_ids"])
+
+        for span in range(num_spans):
+            span_input = [
+                numpy.array(tokenized_example[key][span])
+                for key in self.onnx_input_names
+            ]
+            span_engine_inputs.append(span_input)
+
+            span_extra_info.append(
+                {
+                    key: _convert_to_numpy_array(tokenized_example[key][span])
+                    for key in tokenized_example.keys()
+                    if key not in self.onnx_input_names
+                }
+            )
+
         # add batch dimension, assuming batch size 1
-        engine_inputs = [numpy.expand_dims(inp, axis=0) for inp in engine_inputs]
+        engine_inputs = list(map(numpy.stack, zip(*span_engine_inputs)))
 
         return engine_inputs, dict(
-            features=features,
-            example=squad_example,
+            span_extra_info=span_extra_info, example=squad_example
         )
 
     def process_engine_outputs(
-        self, engine_outputs: List[numpy.ndarray], **kwargs
+        self,
+        engine_outputs: List[List[numpy.ndarray]],
+        **kwargs,
     ) -> BaseModel:
         """
         :param engine_outputs: list of numpy arrays that are the output of the engine
@@ -221,189 +282,332 @@ class QuestionAnsweringPipeline(TransformersPipeline):
         :return: outputs of engine post-processed into an object in the `output_schema`
             format of this pipeline
         """
-        features = kwargs["features"]
+        span_extra_info = kwargs["span_extra_info"]
         example = kwargs["example"]
-        start_vals, end_vals = engine_outputs[:2]
+        num_spans = len(span_extra_info)
 
-        # assuming batch size 0
-        start = start_vals[0]
-        end = end_vals[0]
+        if len(engine_outputs) != 2:
+            raise ValueError(
+                "`engine_outputs` should be a list with two elements "
+                "[start_logits, end_logits]."
+            )
 
-        # Ensure padded tokens & question tokens cannot belong
-        undesired_tokens = (
-            numpy.abs(numpy.array(features.p_mask) - 1) & features.attention_mask
+        all_start_logits, all_end_logits = engine_outputs
+
+        if (
+            all_start_logits.shape[0] != num_spans
+            or all_end_logits.shape[0] != num_spans
+        ):
+            raise ValueError(
+                f"Engine outputs expected for {num_spans} span(s), "
+                f"but found for {len(engine_outputs)}"
+            )
+
+        if self.version_2_with_negative:
+            scores_diff_json = collections.OrderedDict()
+            null_score_diff_threshold = 0.0
+
+        min_null_prediction = None
+        prelim_predictions = []
+        for span_idx in range(num_spans):
+            start_logits = all_start_logits[span_idx]
+            end_logits = all_end_logits[span_idx]
+
+            # This is what will allow us to map some the positions in our logits to
+            # span of texts in the original context.
+            offset_mapping = span_extra_info[span_idx]["offset_mapping"]
+
+            # Optional `token_is_max_context`, if provided we will remove answers
+            # that do not have the maximum context available in the current feature.
+            token_is_max_context = span_extra_info[span_idx].get(
+                "token_is_max_context", None
+            )
+
+            # Update minimum null prediction.
+            feature_null_score = start_logits[0] + end_logits[0]
+            if (
+                min_null_prediction is None
+                or min_null_prediction["score"] > feature_null_score
+            ):
+                min_null_prediction = {
+                    "offsets": (0, 0),
+                    "score": feature_null_score,
+                    "start_logit": start_logits[0],
+                    "end_logit": end_logits[0],
+                }
+
+            # Go through all possibilities for the `self.n_best_size` greater start
+            # and end logits.
+            start_indexes = numpy.argsort(start_logits)[
+                -1 : -self.n_best_size - 1 : -1
+            ].tolist()
+            end_indexes = numpy.argsort(end_logits)[
+                -1 : -self.n_best_size - 1 : -1
+            ].tolist()
+            for start_index in start_indexes:
+                for end_index in end_indexes:
+                    # Don't consider out-of-scope answers, either because the indices
+                    # are out of bounds or correspond to part of the input_ids that
+                    # are not in the context.
+                    if (
+                        start_index >= len(offset_mapping)
+                        or end_index >= len(offset_mapping)
+                        or offset_mapping[start_index] is None
+                        or len(offset_mapping[start_index]) < 2
+                        or offset_mapping[end_index] is None
+                        or len(offset_mapping[end_index]) < 2
+                    ):
+                        continue
+                    # Don't consider answers with a length that is
+                    # either < 0 or > max_answer_length.
+                    if (
+                        end_index < start_index
+                        or end_index - start_index + 1 > self.max_answer_length
+                    ):
+                        continue
+                    # Don't consider answer that don't have the maximum context
+                    # available (if such information is provided).
+                    if (
+                        token_is_max_context is not None
+                        and not token_is_max_context.get(str(start_index), False)
+                    ):
+                        continue
+                    prelim_predictions.append(
+                        {
+                            "offsets": (
+                                offset_mapping[start_index][0],
+                                offset_mapping[end_index][1],
+                            ),
+                            "score": start_logits[start_index] + end_logits[end_index],
+                            "start_logit": start_logits[start_index],
+                            "end_logit": end_logits[end_index],
+                        }
+                    )
+        if self.version_2_with_negative:
+            # Add the minimum null prediction
+            prelim_predictions.append(min_null_prediction)
+            null_score = min_null_prediction["score"]
+
+        # Only keep the best `self.n_best_size` predictions.
+        predictions = sorted(
+            prelim_predictions, key=lambda x: x["score"], reverse=True
+        )[: self.n_best_size]
+
+        # Add back the minimum null prediction if it was removed because of its
+        # low score.
+        if self.version_2_with_negative and not any(
+            p["offsets"] == (0, 0) for p in predictions
+        ):
+            predictions.append(min_null_prediction)
+
+        best_start, best_end = predictions[0]["offsets"]
+        best_score = predictions[0]["score"]
+
+        # Use the offsets to gather the answer text in the original context.
+        context = example.context_text
+        for pred in predictions:
+            offsets = pred.pop("offsets")
+            pred["text"] = context[offsets[0] : offsets[1]]
+
+        # In the very rare edge case we have not a single non-null prediction, we
+        # create a fake prediction to avoid failure
+        if len(predictions) == 0 or (
+            len(predictions) == 1 and predictions[0]["text"] == ""
+        ):
+            predictions.insert(
+                0, {"text": "empty", "start_logit": 0.0, "end_logit": 0.0, "score": 0.0}
+            )
+
+        # Compute the softmax of all scores (we do it with numpy to stay independent
+        # from torch/tf in this file, using the LogSumExp trick)
+        scores = numpy.array([pred.pop("score") for pred in predictions])
+        exp_scores = numpy.exp(scores - numpy.max(scores))
+        probs = exp_scores / exp_scores.sum()
+
+        # Include the probabilities in our predictions.
+        for prob, pred in zip(probs, predictions):
+            pred["probability"] = prob
+
+        # The dictionaries we have to fill.
+        all_predictions = collections.OrderedDict()
+        all_nbest_json = collections.OrderedDict()
+
+        # Pick the best prediction. If the null answer is not possible, this is easy.
+        if not self.version_2_with_negative:
+            all_predictions[example.qas_id] = predictions[0]["text"]
+        else:
+            # Otherwise we first need to find the best non-empty prediction.
+            i = 0
+            while predictions[i]["text"] == "":
+                i += 1
+            best_non_null_pred = predictions[i]
+
+            # Then we compare to the null prediction using the threshold.
+            score_diff = (
+                null_score
+                - best_non_null_pred["start_logit"]
+                - best_non_null_pred["end_logit"]
+            )
+            scores_diff_json[example.qas_id] = float(
+                score_diff
+            )  # To be JSON-serializable.
+            if score_diff > null_score_diff_threshold:
+                all_predictions[example.qas_id] = ""
+            else:
+                all_predictions[example.qas_id] = best_non_null_pred["text"]
+
+        # Make `predictions` JSON-serializable by casting numpy.float back to float.
+        all_nbest_json[example.qas_id] = [
+            {
+                k: (
+                    float(v)
+                    if isinstance(v, (numpy.float16, numpy.float32, numpy.float64))
+                    else v
+                )
+                for k, v in pred.items()
+            }
+            for pred in predictions
+        ]
+
+        if self.output_dir is not None:
+            scores_diff_json = (
+                None if not self.version_2_with_negative else scores_diff_json
+            )
+            self._save_predictions(all_predictions, all_nbest_json, scores_diff_json)
+
+        return self.output_schema(
+            score=best_score,
+            start=best_start,
+            end=best_end,
+            answer=example.context_text[best_start:best_end],
         )
 
-        # Generate mask
-        undesired_tokens_mask = undesired_tokens == 0.0
-
-        # Make sure non-context indexes cannot contribute to the softmax
-        start = numpy.where(undesired_tokens_mask, -10000.0, start)
-        end = numpy.where(undesired_tokens_mask, -10000.0, end)
-
-        # Normalize logits and spans to retrieve the answer
-        start = numpy.exp(
-            start - numpy.log(numpy.sum(numpy.exp(start), axis=-1, keepdims=True))
+    @staticmethod
+    def route_input_to_bucket(
+        *args, input_schema: BaseModel, pipelines: List[TransformersPipeline], **kwargs
+    ) -> Pipeline:
+        """
+        :param input_schema: The schema representing an input to the pipeline
+        :param pipelines: Different buckets to be used
+        :return: The correct Pipeline object (or Bucket) to route input to
+        """
+        tokenizer = pipelines[-1].tokenizer
+        tokens = tokenizer(
+            " ".join((input_schema.context, input_schema.question)),
+            add_special_tokens=True,
+            return_tensors="np",
+            padding=False,
+            truncation=False,
         )
-        end = numpy.exp(
-            end - numpy.log(numpy.sum(numpy.exp(end), axis=-1, keepdims=True))
-        )
+        input_seq_len = max(map(len, tokens["input_ids"]))
+        return TransformersPipeline.select_bucket_by_seq_len(input_seq_len, pipelines)
 
-        # Mask CLS
-        start[0] = 0.0
-        end[0] = 0.0
+    def _tokenize(self, example: SquadExample, *args):
+        # The logic here closely matches the tokenization step performed
+        # on evaluation dataset in the SparseML question answering training script
 
-        ans_start, ans_end, scores = self._decode(start, end)
-        # assuming one stride, so grab first idx
-        ans_start = ans_start[0]
-        ans_end = ans_end[0]
-        score = scores[0]
+        added_special_tokens = self.tokenizer.num_special_tokens_to_add()
+        effective_max_length = self.sequence_length - added_special_tokens
+        if self.doc_stride >= effective_max_length:
+            new_doc_stride = effective_max_length
+            warnings.warn(
+                f"Tokenizer stride set to {self.doc_stride}, "
+                f"which is greater than or equal to its effective max length "
+                f"of {effective_max_length} (= {self.sequence_length} "
+                f"original max length - {added_special_tokens} added special tokens). "
+                f"Capping the doc stride to {new_doc_stride}"
+            )
+            self._doc_stride = new_doc_stride
 
-        # decode start, end idx into text
         if not self.tokenizer.is_fast:
-            char_to_word = numpy.array(example.char_to_word_offset)
-            return self.output_schema(
-                score=score.item(),
-                start=numpy.where(
-                    char_to_word == features.token_to_orig_map[ans_start]
-                )[0][0].item(),
-                end=numpy.where(char_to_word == features.token_to_orig_map[ans_end])[0][
-                    -1
-                ].item(),
-                answer=" ".join(
-                    example.doc_tokens[
-                        features.token_to_orig_map[
-                            ans_start
-                        ] : features.token_to_orig_map[ans_end]
-                        + 1
-                    ]
-                ),
+            raise ValueError(
+                "This example script only works for models that have a fast tokenizer."
             )
         else:
-            question_first = bool(self.tokenizer.padding_side == "right")
-
-            # Sometimes the max probability token is in the middle of a word so:
-            # we start by finding the right word containing the token with
-            # `token_to_word` then we convert this word in a character span
-            return self.output_schema(
-                score=score.item(),
-                start=features.encoding.word_to_chars(
-                    features.encoding.token_to_word(ans_start),
-                    sequence_index=1 if question_first else 0,
-                )[0],
-                end=features.encoding.word_to_chars(
-                    features.encoding.token_to_word(ans_end),
-                    sequence_index=1 if question_first else 0,
-                )[1],
-                answer=example.context_text[
-                    features.encoding.word_to_chars(
-                        features.encoding.token_to_word(ans_start),
-                        sequence_index=1 if question_first else 0,
-                    )[0] : features.encoding.word_to_chars(
-                        features.encoding.token_to_word(ans_end),
-                        sequence_index=1 if question_first else 0,
-                    )[
-                        1
-                    ]
-                ],
-            )
-
-    def _tokenize(self, example: SquadExample):
-        if not self.tokenizer.is_fast:
-            features = squad_convert_examples_to_features(
-                examples=[example],
-                tokenizer=self.tokenizer,
-                max_set_length=self.sequence_length,
-                doc_stride=self.doc_stride,
-                max_query_length=self.max_question_length,
-                padding_strategy=PaddingStrategy.MAX_LENGTH.value,
-                is_training=False,
-                tqdm_enabled=False,
-            )
-            # only 1 span supported so taking only the first element of features
-            # to add support for num_spans switch to features = features[:num_spans]
-            # not included for now due to static batch requirements in production
-            features = features[0]
-        else:
-            question_first = bool(self.tokenizer.padding_side == "right")
-            encoded_inputs = self.tokenizer(
-                text=example.question_text if question_first else example.context_text,
+            pad_on_right = self.tokenizer.padding_side == "right"
+            tokenized_example = self.tokenizer(
+                text=example.question_text if pad_on_right else example.context_text,
                 text_pair=(
-                    example.context_text if question_first else example.question_text
+                    example.context_text if pad_on_right else example.question_text
                 ),
-                padding=PaddingStrategy.MAX_LENGTH.value,
-                truncation="only_second" if question_first else "only_first",
+                truncation="only_second" if pad_on_right else "only_first",
                 max_length=self.sequence_length,
                 stride=self.doc_stride,
-                return_tensors="np",
                 return_token_type_ids=True,
                 return_overflowing_tokens=True,
                 return_offsets_mapping=True,
                 return_special_tokens_mask=True,
+                padding="max_length" if self.pad_to_max_length else False,
             )
 
-            # only 1 span supported so taking only the first element of features
-            # to add support for num_spans switch hardcoded 0 idx lookups to loop
-            # over values in num_spans
+            # For evaluation, we will need to convert our predictions to substrings of
+            # the context, so we keep the corresponding example_id and we will store
+            # the offset mappings.
+            tokenized_example["example_id"] = []
 
-            # p_mask: mask with 1 for token than cannot be in the answer
-            # We put 0 on the tokens from the context and 1 everywhere else
-            p_mask = numpy.asarray(
-                [
-                    [
-                        tok != 1 if question_first else 0
-                        for tok in encoded_inputs.sequence_ids(0)
-                    ]
+            n_spans = len(tokenized_example["input_ids"])
+            for span in range(n_spans):
+                # Grab the sequence corresponding to that example
+                # (to know what is the context and what is the question).
+                sequence_ids = tokenized_example.sequence_ids(span)
+                context_index = 1 if pad_on_right else 0
+
+                # Set to None the offset_mapping that are not part of the context so
+                # it's easy to determine if a token position is part of the
+                # context or not
+                tokenized_example["offset_mapping"][span] = [
+                    (ofmap if sequence_ids[key] == context_index else None)
+                    for key, ofmap in enumerate(
+                        tokenized_example["offset_mapping"][span]
+                    )
                 ]
-            )
 
-            # keep the cls_token unmasked
-            if self.tokenizer.cls_token_id is not None:
-                cls_index = numpy.nonzero(
-                    encoded_inputs["input_ids"][0] == self.tokenizer.cls_token_id
-                )
-                p_mask[cls_index] = 0
+                tokenized_example["example_id"].append(example.qas_id)
 
-            features = SquadFeatures(
-                input_ids=encoded_inputs["input_ids"][0],
-                attention_mask=encoded_inputs["attention_mask"][0],
-                token_type_ids=encoded_inputs["token_type_ids"][0],
-                p_mask=p_mask[0].tolist(),
-                encoding=encoded_inputs[0],
-                # the following values are unused for fast tokenizers
-                cls_index=None,
-                token_to_orig_map={},
-                example_index=0,
-                unique_id=0,
-                paragraph_len=0,
-                token_is_max_context=0,
-                tokens=[],
-                start_position=0,
-                end_position=0,
-                is_impossible=False,
-                qas_id=None,
-            )
+            if self._num_spans is not None:
+                tokenized_example = {
+                    k: tokenized_example[k][: self._num_spans]
+                    for k in tokenized_example.keys()
+                }
 
-        return features
+            return tokenized_example
 
-    def _decode(self, start: numpy.ndarray, end: numpy.ndarray) -> Tuple:
-        # Ensure we have batch axis
-        if start.ndim == 1:
-            start = start[None]
+    def _save_predictions(self, all_predictions, all_nbest_json, scores_diff_json):
+        if not os.path.exists(self.output_dir):
+            raise ValueError(f"Output folder {self.output_dir} not found.")
 
-        if end.ndim == 1:
-            end = end[None]
+        if not os.path.isdir(self.output_dir):
+            raise EnvironmentError(f"{self.output_dir} is not a directory.")
 
-        # Compute the score of each tuple(start, end) to be the real answer
-        outer = numpy.matmul(numpy.expand_dims(start, -1), numpy.expand_dims(end, 1))
+        prediction_file = os.path.join(self.output_dir, "predictions.json")
+        nbest_file = os.path.join(self.output_dir, "nbest_predictions.json")
+        if self.version_2_with_negative:
+            null_odds_file = os.path.join(self.output_dir, "null_odds.json")
 
-        # Remove candidate with end < start and end - start > max_answer_len
-        candidates = numpy.tril(numpy.triu(outer), self.max_answer_length - 1)
+        mode = "a" if os.path.exists(prediction_file) else "w"
+        with open(prediction_file, mode) as writer:
+            writer.write(json.dumps(all_predictions, indent=4) + "\n")
 
-        #  Inspired by Chen & al. (https://github.com/facebookresearch/DrQA)
-        scores_flat = candidates.flatten()
-        # only returning best result, use argsort for topk support
-        idx_sort = [numpy.argmax(scores_flat)]
+        mode = "a" if os.path.exists(nbest_file) else "w"
+        with open(nbest_file, mode) as writer:
+            writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
 
-        start, end = numpy.unravel_index(idx_sort, candidates.shape)[1:]
-        return start, end, candidates[0, start, end]
+        if self.version_2_with_negative:
+            mode = "a" if os.path.exists(null_odds_file) else "w"
+            with open(null_odds_file, mode) as writer:
+                writer.write(json.dumps(scores_diff_json, indent=4) + "\n")
+
+
+def _convert_to_numpy_array(array):
+    """
+    Convert a list to a numpy array. If the list contains non-numeric values,
+    convert to an array of objects.
+
+    :param array: The list to convert
+    :return: The converted numpy array
+    """
+    try:
+        return numpy.array(array)
+    except ValueError:
+        # If the array contains non-numeric values, convert to an array of objects
+        return numpy.array(array, dtype=object)

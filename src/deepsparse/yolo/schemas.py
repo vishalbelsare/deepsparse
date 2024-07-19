@@ -14,12 +14,17 @@
 
 
 """
-Input/Output Schemas for Image Segmentation with YOLO
+Input/Output Schemas for Object Detection with YOLO
 """
-from collections import namedtuple
-from typing import Any, List, Union
 
-from pydantic import BaseModel, Field
+from collections import namedtuple
+from typing import Any, Iterable, List, Optional, TextIO, Union
+
+import numpy
+from PIL import Image
+from pydantic import BaseModel, ConfigDict, Field
+
+from deepsparse.pipelines.computer_vision import ComputerVisionSchema
 
 
 __all__ = [
@@ -27,51 +32,98 @@ __all__ = [
     "YOLOInput",
 ]
 
-_YOLOImageOutput = namedtuple(
-    "_YOLOImageOutput", ["predictions", "boxes", "scores", "labels"]
-)
+_YOLOImageOutput = namedtuple("_YOLOImageOutput", ["boxes", "scores", "labels"])
 
 
-class YOLOInput(BaseModel):
+class YOLOInput(ComputerVisionSchema):
     """
-    Input model for image classification
+    Input model for object detection
     """
 
-    images: Union[str, List[str], List[Any]] = Field(
-        description="List of Images to process"
+    iou_thres: float = Field(
+        default=0.25,
+        description="minimum IoU overlap threshold for a prediction to be valid",
+    )
+    conf_thres: float = Field(
+        default=0.45,
+        description="minimum confidence score for a prediction to be valid",
+    )
+    multi_label: bool = Field(
+        default=False,
+        description=(
+            "when true, allow multi-label assignment to each detected object. Defaults "
+            "to False to mimic yolov5 detection pathway. Note that yolov5 validation "
+            "pathway by default run with multi_label on"
+        ),
+    )
+    return_masks: bool = Field(
+        default=True,
+        description="Controls whether the pipeline should additionally "
+        "return segmentation masks (if running a segmentation model)",
+    )
+    return_intermediate_outputs: bool = Field(
+        default=False,
+        description="Controls whether the pipeline should additionally "
+        "return intermediate outputs from the model",
     )
 
-    class Config:
-        arbitrary_types_allowed = True
+    @classmethod
+    def from_files(
+        cls, files: Iterable[TextIO], *args, from_server: bool = False, **kwargs
+    ) -> "YOLOInput":
+        """
+        :param files: Iterable of file pointers to create YOLOInput from
+        :param kwargs: extra keyword args to pass to YOLOInput constructor
+        :return: YOLOInput constructed from files
+        """
+        if "images" in kwargs:
+            raise ValueError(
+                f"argument 'images' cannot be specified in {cls.__name__} when "
+                "constructing from file(s)"
+            )
+        files_numpy = [numpy.array(Image.open(file)) for file in files]
+        input_schema = cls(
+            # if the input comes through the client-server communication
+            # do not return segmentation masks
+            *args,
+            images=files_numpy,
+            return_masks=not from_server,
+            **kwargs,
+        )
+        return input_schema
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class YOLOOutput(BaseModel):
     """
-    Output model for image classification
+    Output model for object detection
     """
 
-    predictions: List[List[List[float]]] = Field(description="List of predictions")
     boxes: List[List[List[float]]] = Field(
         description="List of bounding boxes, one for each prediction"
     )
     scores: List[List[float]] = Field(
         description="List of scores, one for each prediction"
     )
-    labels: List[List[str]] = Field(
+    labels: List[Union[List[str], List[float]]] = Field(
         description="List of labels, one for each prediction"
+    )
+    intermediate_outputs: Optional[Any] = Field(
+        default=None,
+        description="Intermediate outputs from the YOLOv8 segmentation model.",
     )
 
     def __getitem__(self, index):
-        if index >= len(self.predictions):
+        if index >= len(self.boxes):
             raise IndexError("Index out of range")
 
         return _YOLOImageOutput(
-            self.predictions[index],
             self.boxes[index],
             self.scores[index],
             self.labels[index],
         )
 
     def __iter__(self):
-        for index in range(len(self.predictions)):
+        for index in range(len(self.boxes)):
             yield self[index]

@@ -13,8 +13,13 @@
 # limitations under the License.
 
 # flake8: noqa
+# isort: skip_file
 
 from .pipeline import *
 from .question_answering import *
 from .text_classification import *
 from .token_classification import *
+from .text_generation import *
+from .zero_shot_text_classification import *
+from .embedding_extraction import *
+from .code_generation import *

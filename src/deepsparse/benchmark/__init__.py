@@ -14,5 +14,11 @@
 
 # flake8: noqa
 
-from .ort_engine import ORTEngine
+from deepsparse.analytics import deepsparse_analytics as _analytics
+
+from .ort_engine import *
 from .results import *
+from .torchscript_engine import *
+
+
+_analytics.send_event("python__benchmark__init")

@@ -31,18 +31,15 @@ from .cpu import (
     cpu_vnni_compatible,
 )
 from .engine import *
+from .pipeline_config import *
+from .tasks import *
 from .pipeline import *
 from .version import __version__, is_release
+from .analytics import deepsparse_analytics as _analytics
+from .subgraph_execute import *
+from .analyze import analyze
+from .evaluation.evaluator import evaluate
+from .benchmark.benchmark_model import benchmark_model
+from .benchmark.benchmark_pipeline import benchmark_pipeline
 
-
-try:
-    from sparsezoo.package import check_package_version as _check_package_version
-
-    _check_package_version(
-        package_name=__name__ if is_release else f"{__name__}-nightly",
-        package_version=__version__,
-    )
-except Exception as err:
-    print(
-        f"Need sparsezoo version above 0.9.0 to run Neural Magic's latest-version check\n{err}"
-    )
+_analytics.send_event("python__init")

@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 from transformers.file_utils import ExplicitEnum
 from transformers.tokenization_utils_base import PaddingStrategy, TruncationStrategy
 
-from deepsparse import Pipeline
+from deepsparse.legacy import Pipeline
 from deepsparse.transformers.pipelines import TransformersPipeline
 
 
@@ -76,6 +76,14 @@ class TokenClassificationInput(BaseModel):
             "a token_classification task"
         )
     )
+    is_split_into_words: bool = Field(
+        default=False,
+        description=(
+            "True if the input is a batch size 1 list of strings representing. "
+            "individual word tokens. Currently only supports batch size 1. "
+            "Default is False"
+        ),
+    )
 
 
 class TokenClassificationResult(BaseModel):
@@ -85,19 +93,27 @@ class TokenClassificationResult(BaseModel):
 
     entity: str = Field(description="entity predicted for that token/word")
     score: float = Field(description="The corresponding probability for `entity`")
-    index: int = Field(description="index of the corresponding token in the sentence")
     word: str = Field(description="token/word classified")
     start: Optional[int] = Field(
+        None,
         description=(
             "index of the start of the corresponding entity in the sentence. "
             "Only exists if the offsets are available within the tokenizer"
-        )
+        ),
     )
     end: Optional[int] = Field(
+        None,
         description=(
             "index of the end of the corresponding entity in the sentence. "
             "Only exists if the offsets are available within the tokenizer"
-        )
+        ),
+    )
+    index: Optional[int] = Field(
+        description=(
+            "index of the corresponding token in the sentence. "
+            "Only supplied when aggregation_strategy='none'"
+        ),
+        default=None,
     )
     is_grouped: bool = Field(
         default=False,
@@ -123,10 +139,7 @@ class TokenClassificationOutput(BaseModel):
 @Pipeline.register(
     task="token_classification",
     task_aliases=["ner"],
-    default_model_path=(
-        "zoo:nlp/token_classification/bert-base/pytorch/huggingface/"
-        "conll2003/12layer_pruned80_quant-none-vnni"
-    ),
+    default_model_path=("zoo:distilbert-conll2003_wikipedia_bookcorpus-pruned90"),
 )
 class TokenClassificationPipeline(TransformersPipeline):
     """
@@ -141,10 +154,8 @@ class TokenClassificationPipeline(TransformersPipeline):
     )
     ```
 
-    :param model_path: sparsezoo stub to a transformers model, an ONNX file, or
-        (preferred) a directory containing a model.onnx, tokenizer config, and model
-        config. If no tokenizer and/or model config(s) are found, then they will be
-        loaded from huggingface transformers using the `default_model_name` key
+    :param model_path: sparsezoo stub to a transformers model or (preferred) a
+        directory containing a model.onnx, tokenizer config, and model config
     :param engine_type: inference engine to use. Currently supported values include
         'deepsparse' and 'onnxruntime'. Default is 'deepsparse'
     :param batch_size: static batch size to use for inference. Default is 1
@@ -157,28 +168,27 @@ class TokenClassificationPipeline(TransformersPipeline):
     :param alias: optional name to give this pipeline instance, useful when
         inferencing with multiple models. Default is None
     :param sequence_length: sequence length to compile model and tokenizer for.
-        Default is 128
-    :param default_model_name: huggingface transformers model name to use to
-        load a tokenizer and model config when none are provided in the `model_path`.
-        Default is 'bert-base-uncased'
+        If a list of lengths is provided, then for each length, a model and
+        tokenizer will be compiled capable of handling that sequence length
+        (also known as a bucket). Default is 128
     :param aggregation_strategy: how to aggregate tokens in postprocessing. Options
         include 'none', 'simple', 'first', 'average', and 'max'. Default is None
     :param ignore_labels: list of label names to ignore in output. Default is
-        ['0'] which ignores the default known class label
+        ['O'] which ignores the default known class label
     """
 
     def __init__(
         self,
         *,
         aggregation_strategy: AggregationStrategy = AggregationStrategy.NONE,
-        ignore_labels: List[str] = None,
+        ignore_labels: Optional[List[str]] = None,
         **kwargs,
     ):
 
         if isinstance(aggregation_strategy, str):
             aggregation_strategy = aggregation_strategy.strip().lower()
         self._aggregation_strategy = AggregationStrategy(aggregation_strategy)
-        self._ignore_labels = ["0"] if ignore_labels is None else ignore_labels
+        self._ignore_labels = ["O"] if ignore_labels is None else ignore_labels
 
         super().__init__(**kwargs)
 
@@ -250,6 +260,9 @@ class TokenClassificationPipeline(TransformersPipeline):
             and dictionary containing offset mappings and special tokens mask to
             be used during postprocessing
         """
+        if inputs.is_split_into_words and self.engine.batch_size != 1:
+            raise ValueError("is_split_into_words=True only supported for batch size 1")
+
         tokens = self.tokenizer(
             inputs.inputs,
             return_tensors="np",
@@ -257,6 +270,7 @@ class TokenClassificationPipeline(TransformersPipeline):
             padding=PaddingStrategy.MAX_LENGTH.value,
             return_special_tokens_mask=True,
             return_offsets_mapping=self.tokenizer.is_fast,
+            is_split_into_words=inputs.is_split_into_words,
         )
 
         offset_mapping = (
@@ -265,11 +279,29 @@ class TokenClassificationPipeline(TransformersPipeline):
             else [None] * len(inputs.inputs)
         )
         special_tokens_mask = tokens.pop("special_tokens_mask")
+
+        word_start_mask = None
+        if inputs.is_split_into_words:
+            # create mask for word in the split words where values are True
+            # if they are the start of a tokenized word
+            word_start_mask = []
+            word_ids = tokens.word_ids(batch_index=0)
+            previous_id = None
+            for word_id in word_ids:
+                if word_id is None:
+                    continue
+                if word_id != previous_id:
+                    word_start_mask.append(True)
+                    previous_id = word_id
+                else:
+                    word_start_mask.append(False)
+
         postprocessing_kwargs = dict(
             inputs=inputs,
             tokens=tokens,
             offset_mapping=offset_mapping,
             special_tokens_mask=special_tokens_mask,
+            word_start_mask=word_start_mask,
         )
 
         return self.tokens_to_engine_input(tokens), postprocessing_kwargs
@@ -289,6 +321,7 @@ class TokenClassificationPipeline(TransformersPipeline):
         tokens = kwargs["tokens"]
         offset_mapping = kwargs["offset_mapping"]
         special_tokens_mask = kwargs["special_tokens_mask"]
+        word_start_mask = kwargs["word_start_mask"]
 
         predictions = []  # type: List[List[TokenClassificationResult]]
 
@@ -298,6 +331,7 @@ class TokenClassificationPipeline(TransformersPipeline):
             scores = numpy.exp(current_entities) / numpy.exp(current_entities).sum(
                 -1, keepdims=True
             )
+
             pre_entities = self._gather_pre_entities(
                 inputs.inputs[entities_index],
                 input_ids,
@@ -308,9 +342,11 @@ class TokenClassificationPipeline(TransformersPipeline):
             grouped_entities = self._aggregate(pre_entities)
             # Filter anything that is in self.ignore_labels
             current_results = []  # type: List[TokenClassificationResult]
-            for entity in grouped_entities:
-                if entity.get("entity") in self.ignore_labels or (
-                    entity.get("entity_group") in self.ignore_labels
+            for entity_idx, entity in enumerate(grouped_entities):
+                if (
+                    entity.get("entity") in self.ignore_labels
+                    or (entity.get("entity_group") in self.ignore_labels)
+                    or (word_start_mask and not word_start_mask[entity_idx])
                 ):
                     continue
                 if entity.get("entity_group"):
@@ -321,6 +357,26 @@ class TokenClassificationPipeline(TransformersPipeline):
             predictions.append(current_results)
 
         return self.output_schema(predictions=predictions)
+
+    @staticmethod
+    def route_input_to_bucket(
+        *args, input_schema: BaseModel, pipelines: List[TransformersPipeline], **kwargs
+    ) -> Pipeline:
+        """
+        :param input_schema: The schema representing an input to the pipeline
+        :param pipelines: Different buckets to be used
+        :return: The correct Pipeline object (or Bucket) to route input to
+        """
+        tokenizer = pipelines[-1].tokenizer
+        tokens = tokenizer(
+            input_schema.inputs,
+            add_special_tokens=True,
+            return_tensors="np",
+            padding=False,
+            truncation=False,
+        )
+        input_seq_len = max(map(len, tokens["input_ids"]))
+        return TransformersPipeline.select_bucket_by_seq_len(input_seq_len, pipelines)
 
     # utilities below adapted from transformers
 
@@ -468,7 +524,6 @@ class TokenClassificationPipeline(TransformersPipeline):
         return bi, tag
 
     def _group_entities(self, entities: List[dict]) -> List[dict]:
-
         entity_groups = []
         entity_group_disagg = []
 

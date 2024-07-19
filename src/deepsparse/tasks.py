@@ -16,9 +16,15 @@
 Classes and implementations for supported tasks in the DeepSparse pipeline and system
 """
 
+import importlib
+import logging
+import os
+import sys
 from collections import namedtuple
-from typing import List
+from typing import Iterable, List, Optional, Tuple
 
+
+_LOGGER = logging.getLogger(__name__)
 
 __all__ = ["SupportedTasks", "AliasedTask"]
 
@@ -55,10 +61,14 @@ class AliasedTask:
         """
         :param task: the name of the task to check whether the given instance matches.
             Checks the current name as well as any aliases.
-            Everything is compared at lower case and "-" are replaced with "_".
+            Everything is compared at lower case and "-" and whitespace
+            are replaced with "_".
         :return: True if task does match the current instance, False otherwise
         """
         task = task.lower().replace("-", "_")
+
+        # replace whitespace with "_"
+        task = "_".join(task.split())
 
         return task == self.name or task in self.aliases
 
@@ -68,14 +78,21 @@ class SupportedTasks:
     The supported tasks in the DeepSparse pipeline and system
     """
 
-    nlp = namedtuple(
-        "nlp", ["question_answering", "text_classification", "token_classification"]
+    text_generation = namedtuple(
+        "text_generation", ["text_generation", "opt", "mpt", "llama"]
     )(
-        question_answering=AliasedTask("question_answering", ["qa"]),
-        text_classification=AliasedTask(
-            "text_classification", ["glue", "sentiment_analysis"]
-        ),
-        token_classification=AliasedTask("token_classification", ["ner"]),
+        text_generation=AliasedTask("text_generation", []),
+        opt=AliasedTask("opt", []),
+        mpt=AliasedTask("mpt", []),
+        llama=AliasedTask("llama", []),
+    )
+
+    code_generation = namedtuple(
+        "code_generation", ["code_generation", "code_gen", "codegen"]
+    )(
+        code_generation=AliasedTask("code_generation", []),
+        code_gen=AliasedTask("code_gen", []),
+        codegen=AliasedTask("codegen", []),
     )
 
     image_classification = namedtuple("image_classification", ["image_classification"])(
@@ -85,36 +102,45 @@ class SupportedTasks:
         ),
     )
 
-    yolo = namedtuple("yolo", ["yolo"])(
-        yolo=AliasedTask("yolo", ["yolo"]),
-    )
+    all_task_categories = [text_generation, code_generation, image_classification]
 
     @classmethod
-    def check_register_task(cls, task: str):
-        if cls.is_nlp(task):
-            # trigger transformers pipelines to register with Pipeline.register
-            import deepsparse.transformers.pipelines  # noqa: F401
+    def check_register_task(
+        cls, task: str, extra_tasks: Optional[Iterable[str]] = None
+    ):
+        """
+        :param task: task name to validate and import dependencies for
+        :param extra_tasks: valid task names that are not included in supported tasks.
+            i.e. tasks registered to Pipeline at runtime
+        """
+        if cls.is_text_generation(task):
+            import deepsparse.transformers.pipelines.text_generation  # noqa: F401
+
+        elif cls.is_code_generation(task):
+            import deepsparse.transformers.pipelines.code_generation  # noqa: F401
 
         elif cls.is_image_classification(task):
             # trigger image classification pipelines to
             # register with Pipeline.register
-            import deepsparse.image_classification.pipelines  # noqa: F401
+            import deepsparse.image_classification.pipeline  # noqa: F401
 
-        elif cls.is_yolo(task):
-            # trigger yolo pipelines to register with Pipeline.register
-            import deepsparse.yolo.pipelines  # noqa: F401
+        all_tasks = set(cls.task_names() + (list(extra_tasks or [])))
+        if task not in all_tasks:
+            raise ValueError(
+                f"Unknown Pipeline task {task}. Currently supported tasks are "
+                f"{list(all_tasks)}"
+            )
 
     @classmethod
-    def is_nlp(cls, task: str) -> bool:
+    def is_text_generation(cls, task: str) -> bool:
         """
-        :param task: the name of the task to check whether it is an nlp task
-            such as question_answering
-        :return: True if it is an nlp task, False otherwise
+        :param task: the name of the task to check whether it is a text generation task
+            such as codegen
+        :return: True if it is a text generation task, False otherwise
         """
-        return (
-            cls.nlp.question_answering.matches(task)
-            or cls.nlp.text_classification.matches(task)
-            or cls.nlp.token_classification.matches(task)
+        return any(
+            text_generation_task.matches(task)
+            for text_generation_task in cls.text_generation
         )
 
     @classmethod
@@ -124,13 +150,100 @@ class SupportedTasks:
             classification task
         :return: True if it is an image classification task, False otherwise
         """
-        return cls.image_classification.image_classification.matches(task)
+        return any([ic_task.matches(task) for ic_task in cls.image_classification])
 
     @classmethod
-    def is_yolo(cls, task: str) -> bool:
+    def task_names(cls):
+        task_names = []
+        for task_category in cls.all_task_categories:
+            for task in task_category:
+                unique_aliases = (
+                    alias for alias in task._aliases if alias != task._name
+                )
+                task_names += (task._name, *unique_aliases)
+        return task_names
+
+    @classmethod
+    def is_code_generation(cls, task: str) -> bool:
         """
-        :param task: the name of the task to check whether it is an image
-            segmentation task using YOLO
-        :return: True if it is an segmentation task using YOLO, False otherwise
+        :param task: the name of the task to check whether it is a text generation task
+            such as codegen
+        :return: True if it is a text generation task, False otherwise
         """
-        return cls.yolo.yolo.matches(task)
+        return any(
+            code_generation_task.matches(task)
+            for code_generation_task in cls.code_generation
+        )
+
+
+def dynamic_import_task(module_or_path: str) -> str:
+    """
+    Dynamically imports `module` with importlib, and returns the `TASK`
+    attribute on the module (something like `importlib.import_module(module).TASK`).
+
+    Example contents of `module`:
+    ```python
+    from deepsparse.pipeline import Pipeline
+    from deepsparse.transformers.pipelines.question_answering import (
+        QuestionAnsweringPipeline,
+    )
+
+    TASK = "my_qa_task"
+    Pipeline.register(TASK)(QuestionAnsweringPipeline)
+    ```
+
+    NOTE: this modifies `sys.path`.
+
+    :raises FileNotFoundError: if path does not exist
+    :raises RuntimeError: if the imported module does not contain `TASK`
+    :raises RuntimeError: if the module doesn't register the task
+    :return: The task from the imported module.
+    """
+    parent_dir, module_name = _split_dir_and_name(module_or_path)
+    if not os.path.exists(os.path.join(parent_dir, module_name + ".py")):
+        raise FileNotFoundError(
+            f"Unable to find file for {module_or_path}. "
+            f"Looked for {module_name}.py under {parent_dir if parent_dir else '.'}"
+        )
+
+    # add parent_dir to sys.path so we can import the file as a module
+    sys.path.append(os.curdir)
+    if parent_dir:
+        _LOGGER.info(f"Adding {parent_dir} to sys.path")
+        sys.path.append(parent_dir)
+
+    # do the import
+    _LOGGER.info(f"Importing '{module_name}'")
+    module_or_path = importlib.import_module(module_name)
+
+    if not hasattr(module_or_path, "TASK"):
+        raise RuntimeError(
+            "When using --task import:<module>, "
+            "module must set the `TASK` attribute."
+        )
+
+    task = getattr(module_or_path, "TASK")
+    _LOGGER.info(f"Using task={repr(task)}")
+
+    return task
+
+
+def _split_dir_and_name(module_or_path: str) -> Tuple[str, str]:
+    """
+    Examples:
+    - `a` -> `("", "a")`
+    - `a.b` -> `("a", "b")`
+    - `a.b.c` -> `("a/b", "c")`
+
+    :return: module split into directory & name
+    """
+    if module_or_path.endswith(".py"):
+        # assume path
+        split_char = os.sep
+        module_or_path = module_or_path.replace(".py", "")
+    else:
+        # assume module
+        split_char = "."
+    *dirs, module_name = module_or_path.split(split_char)
+    parent_dir = os.sep if dirs == [""] else os.sep.join(dirs)
+    return parent_dir, module_name
